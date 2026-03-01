@@ -72,9 +72,10 @@ PM_DISCOVERY_INTERVAL = 30
 
 def get_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn = sqlite3.connect(str(DB_PATH), timeout=120)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=120000")
 
     # Binance OHLCV candles
     conn.execute("""
@@ -490,6 +491,7 @@ def parse_book_side(levels: list[dict]) -> list[tuple[float, float]]:
 def snapshot_polymarket_books(conn: sqlite3.Connection, active_markets: list[dict]):
     """Take a book snapshot for all active Polymarket markets."""
     ts = int(time.time() * 1000)
+    rows = []
 
     for mkt in active_markets:
         try:
@@ -524,14 +526,7 @@ def snapshot_polymarket_books(conn: sqlite3.Connection, active_markets: list[dic
             up_book_json = json.dumps({"bids": up_bids[:10], "asks": up_asks[:10]})
             down_book_json = json.dumps({"bids": down_bids[:10], "asks": down_asks[:10]})
 
-            conn.execute("""
-                INSERT INTO pm_book_snapshots
-                (coin, timeframe, timestamp, condition_id, question, end_date,
-                 up_best_bid, up_best_ask, up_mid, up_spread, up_bid_depth, up_ask_depth, up_book_json,
-                 down_best_bid, down_best_ask, down_mid, down_spread, down_bid_depth, down_ask_depth, down_book_json,
-                 combined_mid, implied_edge)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
+            rows.append((
                 mkt["coin"], mkt["timeframe"], ts, mkt["condition_id"], mkt["question"], mkt["end_date"],
                 up_best_bid, up_best_ask, up_mid, up_spread, up_bid_depth, up_ask_depth, up_book_json,
                 down_best_bid, down_best_ask, down_mid, down_spread, down_bid_depth, down_ask_depth, down_book_json,
@@ -540,7 +535,16 @@ def snapshot_polymarket_books(conn: sqlite3.Connection, active_markets: list[dic
         except Exception as e:
             log.warning(f"[pm] Snapshot error for {mkt['coin']}/{mkt['timeframe']}: {e}")
 
-    conn.commit()
+    if rows:
+        conn.executemany("""
+            INSERT INTO pm_book_snapshots
+            (coin, timeframe, timestamp, condition_id, question, end_date,
+             up_best_bid, up_best_ask, up_mid, up_spread, up_bid_depth, up_ask_depth, up_book_json,
+             down_best_bid, down_best_ask, down_mid, down_spread, down_bid_depth, down_ask_depth, down_book_json,
+             combined_mid, implied_edge)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        conn.commit()
 
 
 def check_resolved_markets(conn: sqlite3.Connection, seen_conditions: set[str]):
@@ -648,12 +652,7 @@ def run_collector():
 
     conn = get_db()
 
-    # Start Polymarket collector in background thread
-    pm_thread = threading.Thread(target=polymarket_collector_loop, daemon=True)
-    pm_thread.start()
-    log.info("[main] Polymarket collector thread started")
-
-    # Phase 1: Backfill Binance candles
+    # Phase 1: Backfill Binance candles (before starting PM thread to avoid lock contention)
     log.info("=== BINANCE BACKFILL ===")
     for coin in COINS:
         for tf in TIMEFRAMES:
@@ -664,6 +663,11 @@ def run_collector():
     collect_funding_rates(conn)
     collect_open_interest(conn)
     collect_ticker_snapshots(conn)
+
+    # Start Polymarket collector after backfill to avoid write contention
+    pm_thread = threading.Thread(target=polymarket_collector_loop, daemon=True)
+    pm_thread.start()
+    log.info("[main] Polymarket collector thread started")
 
     # Phase 2: Continuous polling
     log.info("=== POLLING PHASE ===")

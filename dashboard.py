@@ -20,7 +20,8 @@ app = Flask(__name__)
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn = sqlite3.connect(str(DB_PATH), timeout=60)
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.row_factory = sqlite3.Row
     return conn
 
