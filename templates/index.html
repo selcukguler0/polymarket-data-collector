@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Backtest Data Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: #0a0a0f; color: #e0e0e0; min-height: 100vh; }
+
+  .header { padding: 24px 32px; border-bottom: 1px solid #1a1a2e; display: flex; justify-content: space-between; align-items: center; }
+  .header h1 { font-size: 18px; font-weight: 600; color: #fff; }
+  .header .status { font-size: 12px; color: #666; }
+  .header .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #22c55e; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px 32px; }
+
+  /* Section titles */
+  .section-title { font-size: 13px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 1px; margin: 24px 0 12px; }
+  .section-title:first-child { margin-top: 0; }
+
+  /* Stats grid */
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .stat-card { background: #111118; border: 1px solid #1a1a2e; border-radius: 8px; padding: 14px; transition: border-color 0.2s; }
+  .stat-card:hover { border-color: #333; }
+  .stat-card .pair { font-size: 13px; font-weight: 600; color: #fff; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+  .stat-card .pair .tf { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #1a1a2e; color: #888; }
+  .stat-card .pair .tf.pm { background: #1e1a2e; color: #a78bfa; }
+  .stat-card .meta { font-size: 11px; color: #555; line-height: 1.6; }
+  .stat-card .count { color: #f59e0b; font-weight: 500; }
+
+  /* Extra stats row */
+  .extras { display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; }
+  .extra-badge { background: #111118; border: 1px solid #1a1a2e; border-radius: 8px; padding: 10px 16px; font-size: 12px; }
+  .extra-badge .num { color: #f59e0b; font-weight: 600; }
+
+  /* Controls */
+  .controls { background: #111118; border: 1px solid #1a1a2e; border-radius: 8px; padding: 20px; margin-bottom: 24px; }
+  .controls h2 { font-size: 14px; font-weight: 600; margin-bottom: 16px; color: #fff; }
+  .controls-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+  .field select, .field input { background: #0a0a0f; border: 1px solid #1a1a2e; border-radius: 6px; padding: 8px 12px; color: #e0e0e0; font-family: inherit; font-size: 13px; outline: none; min-width: 120px; }
+  .field select:focus, .field input:focus { border-color: #f59e0b; }
+
+  .btn { padding: 8px 18px; border-radius: 6px; border: none; font-family: inherit; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+  .btn-primary { background: #f59e0b; color: #000; }
+  .btn-primary:hover { background: #fbbf24; }
+  .btn-secondary { background: #1a1a2e; color: #e0e0e0; border: 1px solid #333; }
+  .btn-secondary:hover { background: #222; }
+  .btn-ghost { background: transparent; color: #888; border: 1px solid #1a1a2e; }
+  .btn-ghost:hover { color: #fff; border-color: #333; }
+  .btn-purple { background: #7c3aed; color: #fff; }
+  .btn-purple:hover { background: #8b5cf6; }
+
+  /* Preview table */
+  .preview { background: #111118; border: 1px solid #1a1a2e; border-radius: 8px; overflow: hidden; }
+  .preview h2 { font-size: 14px; font-weight: 600; padding: 16px 20px; border-bottom: 1px solid #1a1a2e; color: #fff; }
+  .preview-scroll { overflow-x: auto; }
+  .preview table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .preview th { text-align: left; padding: 8px 12px; color: #666; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #1a1a2e; font-size: 10px; white-space: nowrap; position: sticky; top: 0; background: #111118; }
+  .preview td { padding: 6px 12px; border-bottom: 1px solid #0f0f18; white-space: nowrap; }
+  .preview tr:hover td { background: #0f0f1a; }
+  .green { color: #22c55e; }
+  .red { color: #ef4444; }
+  .purple { color: #a78bfa; }
+  .preview .empty { padding: 40px; text-align: center; color: #444; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Backtest Data Collector</h1>
+  <div class="status"><span class="dot"></span><span id="statusText">Loading...</span></div>
+</div>
+
+<div class="container">
+  <!-- Binance candle stats -->
+  <div class="section-title">Binance Candles</div>
+  <div id="candleGrid" class="stats-grid"></div>
+
+  <!-- Polymarket stats -->
+  <div class="section-title">Polymarket Books</div>
+  <div id="pmGrid" class="stats-grid"></div>
+
+  <!-- Extra data badges -->
+  <div class="section-title">Extra Data</div>
+  <div id="extras" class="extras"></div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <h2>Download & Preview</h2>
+    <div class="controls-row">
+      <div class="field">
+        <label>Dataset</label>
+        <select id="dataset" onchange="onDatasetChange()">
+          <option value="candles">Binance Candles</option>
+          <option value="polymarket">Polymarket Books</option>
+          <option value="funding">Funding Rates</option>
+          <option value="oi">Open Interest</option>
+          <option value="ticker">24h Ticker</option>
+          <option value="outcomes">Market Outcomes</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Coin</label>
+        <select id="coin">
+          <option value="BTC">BTC</option>
+          <option value="ETH">ETH</option>
+          <option value="XRP">XRP</option>
+          <option value="SOL">SOL</option>
+        </select>
+      </div>
+      <div class="field" id="tfField">
+        <label>Timeframe</label>
+        <select id="timeframe">
+          <option value="5m">5 min</option>
+          <option value="15m">15 min</option>
+          <option value="1h">1 hour</option>
+          <option value="1d">1 day</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Start</label>
+        <input type="date" id="startDate">
+      </div>
+      <div class="field">
+        <label>End</label>
+        <input type="date" id="endDate">
+      </div>
+      <button class="btn btn-ghost" onclick="loadPreview()">Preview</button>
+      <button class="btn btn-primary" onclick="downloadCSV(false)">Download CSV</button>
+      <button class="btn btn-secondary" onclick="downloadCSV(true)">All Coins CSV</button>
+    </div>
+  </div>
+
+  <!-- Preview -->
+  <div class="preview">
+    <h2>Preview <span id="previewLabel" style="color:#666;font-weight:400;font-size:12px"></span></h2>
+    <div class="preview-scroll">
+      <div id="previewContent"><div class="empty">Select a dataset and click Preview</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+function onDatasetChange() {
+  const ds = document.getElementById('dataset').value;
+  const tfField = document.getElementById('tfField');
+  // Only show timeframe for datasets that have it
+  tfField.style.display = ['candles', 'polymarket'].includes(ds) ? 'flex' : 'none';
+}
+
+async function loadStats() {
+  try {
+    const resp = await fetch('/api/stats');
+    const data = await resp.json();
+
+    // Candle grid
+    const cg = document.getElementById('candleGrid');
+    if (data.candles.length === 0) {
+      cg.innerHTML = '<div style="color:#555;padding:12px">No candle data yet</div>';
+    } else {
+      cg.innerHTML = data.candles.map(d => `
+        <div class="stat-card">
+          <div class="pair">${d.coin} <span class="tf">${d.timeframe}</span></div>
+          <div class="meta"><span class="count">${d.count.toLocaleString()}</span> candles<br>${d.earliest} &rarr; ${d.latest}</div>
+        </div>`).join('');
+    }
+
+    // PM grid
+    const pg = document.getElementById('pmGrid');
+    if (data.polymarket.length === 0) {
+      pg.innerHTML = '<div style="color:#555;padding:12px">No Polymarket data yet (collector running?)</div>';
+    } else {
+      pg.innerHTML = data.polymarket.map(d => `
+        <div class="stat-card">
+          <div class="pair">${d.coin} <span class="tf pm">${d.timeframe}</span></div>
+          <div class="meta"><span class="count">${d.count.toLocaleString()}</span> snapshots &middot; ${d.markets} markets<br>${d.earliest} &rarr; ${d.latest}</div>
+        </div>`).join('');
+    }
+
+    // Extras
+    const ex = document.getElementById('extras');
+    ex.innerHTML = `
+      <div class="extra-badge">Funding: <span class="num">${data.funding_snapshots.toLocaleString()}</span></div>
+      <div class="extra-badge">Open Interest: <span class="num">${data.oi_snapshots.toLocaleString()}</span></div>
+      <div class="extra-badge">Ticker: <span class="num">${data.ticker_snapshots.toLocaleString()}</span></div>
+      <div class="extra-badge">Resolved Markets: <span class="num">${data.resolved_markets.toLocaleString()}</span></div>
+    `;
+
+    // Total
+    const totalCandles = data.candles.reduce((s, d) => s + d.count, 0);
+    const totalPm = data.polymarket.reduce((s, d) => s + d.count, 0);
+    document.getElementById('statusText').textContent = `${totalCandles.toLocaleString()} candles | ${totalPm.toLocaleString()} PM snapshots`;
+  } catch (e) {
+    document.getElementById('statusText').textContent = 'DB not found — start collector first';
+  }
+}
+
+async function loadPreview() {
+  const ds = document.getElementById('dataset').value;
+  const coin = document.getElementById('coin').value;
+  const tf = document.getElementById('timeframe').value;
+  const start = document.getElementById('startDate').value;
+  const end = document.getElementById('endDate').value;
+
+  let url = `/api/preview?dataset=${ds}&coin=${coin}&timeframe=${tf}`;
+  if (start) url += `&start=${start}`;
+  if (end) url += `&end=${end}`;
+
+  const resp = await fetch(url);
+  const rows = await resp.json();
+  document.getElementById('previewLabel').textContent = `(${ds} / ${coin} / ${tf}, latest 50)`;
+
+  if (rows.length === 0) {
+    document.getElementById('previewContent').innerHTML = '<div class="empty">No data for this selection</div>';
+    return;
+  }
+
+  // Build table dynamically from keys
+  const keys = Object.keys(rows[0]).filter(k => !k.endsWith('_json') && !k.endsWith('_fmt'));
+  const displayKeys = keys.map(k => {
+    // Prefer formatted timestamps
+    if (rows[0][k + '_fmt']) return k + '_fmt';
+    return k;
+  });
+
+  let html = '<table><thead><tr>';
+  for (const k of displayKeys) {
+    html += `<th>${k.replace(/_fmt$/, '').replace(/_/g, ' ')}</th>`;
+  }
+  html += '</tr></thead><tbody>';
+
+  for (const r of rows) {
+    html += '<tr>';
+    for (const k of displayKeys) {
+      let val = r[k];
+      let cls = '';
+      if (typeof val === 'number') {
+        if (k.includes('spread') || k.includes('edge')) cls = val > 0 ? 'green' : 'red';
+        if (k.includes('up_')) cls = 'green';
+        if (k.includes('down_')) cls = 'red';
+        if (k.includes('mid') || k.includes('combined')) cls = 'purple';
+        if (typeof val === 'number' && !Number.isInteger(val)) val = val.toFixed(6);
+      }
+      html += `<td class="${cls}">${val ?? ''}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  document.getElementById('previewContent').innerHTML = html;
+}
+
+function downloadCSV(allCoins) {
+  const ds = document.getElementById('dataset').value;
+  const coin = document.getElementById('coin').value;
+  const tf = document.getElementById('timeframe').value;
+  const start = document.getElementById('startDate').value;
+  const end = document.getElementById('endDate').value;
+
+  let url = `/download?dataset=${ds}&coin=${coin}&timeframe=${tf}`;
+  if (allCoins) url += '&all_coins=true';
+  if (start) url += `&start=${start}`;
+  if (end) url += `&end=${end}`;
+  window.location.href = url;
+}
+
+loadStats();
+setInterval(loadStats, 30000);
+onDatasetChange();
+</script>
+</body>
+</html>

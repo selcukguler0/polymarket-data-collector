@@ -1,0 +1,9 @@
+services:
+  data-collector:
+    build: .
+    container_name: backtest-data-collector
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
