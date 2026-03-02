@@ -135,6 +135,52 @@
     </div>
   </div>
 
+  <!-- Backtest Export -->
+  <div class="controls" id="backtestSection">
+    <h2>Backtest Export</h2>
+    <div class="controls-row" style="margin-bottom:14px">
+      <div class="field">
+        <label>Format</label>
+        <select id="btFormat">
+          <option value="csv">CSV</option>
+          <option value="parquet">Parquet</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Scope</label>
+        <select id="btScope" onchange="onBtScopeChange()">
+          <option value="all">All Resolved</option>
+          <option value="selected">Selected</option>
+        </select>
+      </div>
+      <button class="btn btn-ghost" onclick="listBacktestMarkets()">List Markets</button>
+      <button class="btn btn-purple" id="btExportBtn" onclick="exportBacktest()">Export Backtest ZIP</button>
+    </div>
+    <div id="btMarkets" style="display:none">
+      <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
+        <label style="font-size:11px;color:#888;cursor:pointer"><input type="checkbox" id="btSelectAll" onchange="toggleBtSelectAll()"> Select All</label>
+        <span id="btMarketCount" style="font-size:11px;color:#555"></span>
+      </div>
+      <div class="preview-scroll" style="max-height:340px;overflow-y:auto">
+        <table id="btMarketsTable" style="width:100%;border-collapse:collapse;font-size:11px">
+          <thead>
+            <tr>
+              <th style="padding:6px 8px;border-bottom:1px solid #1a1a2e;color:#666;text-align:left;font-size:10px;position:sticky;top:0;background:#111118"></th>
+              <th style="padding:6px 8px;border-bottom:1px solid #1a1a2e;color:#666;text-align:left;font-size:10px;position:sticky;top:0;background:#111118">Coin</th>
+              <th style="padding:6px 8px;border-bottom:1px solid #1a1a2e;color:#666;text-align:left;font-size:10px;position:sticky;top:0;background:#111118">TF</th>
+              <th style="padding:6px 8px;border-bottom:1px solid #1a1a2e;color:#666;text-align:left;font-size:10px;position:sticky;top:0;background:#111118">Question</th>
+              <th style="padding:6px 8px;border-bottom:1px solid #1a1a2e;color:#666;text-align:left;font-size:10px;position:sticky;top:0;background:#111118">End Date</th>
+              <th style="padding:6px 8px;border-bottom:1px solid #1a1a2e;color:#666;text-align:left;font-size:10px;position:sticky;top:0;background:#111118">Outcome</th>
+              <th style="padding:6px 8px;border-bottom:1px solid #1a1a2e;color:#666;text-align:left;font-size:10px;position:sticky;top:0;background:#111118">Snapshots</th>
+            </tr>
+          </thead>
+          <tbody id="btMarketsBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="btStatus" style="margin-top:10px;font-size:12px;color:#666"></div>
+  </div>
+
   <!-- Preview -->
   <div class="preview">
     <h2>Preview <span id="previewLabel" style="color:#666;font-weight:400;font-size:12px"></span></h2>
@@ -265,6 +311,87 @@ function downloadCSV(allCoins) {
   if (start) url += `&start=${start}`;
   if (end) url += `&end=${end}`;
   window.location.href = url;
+}
+
+// ── Backtest Export ──
+
+let btMarketData = [];
+
+function onBtScopeChange() {
+  const scope = document.getElementById('btScope').value;
+  if (scope === 'selected') {
+    listBacktestMarkets();
+  }
+}
+
+async function listBacktestMarkets() {
+  const container = document.getElementById('btMarkets');
+  const body = document.getElementById('btMarketsBody');
+  const countEl = document.getElementById('btMarketCount');
+
+  body.innerHTML = '<tr><td colspan="7" style="padding:20px;text-align:center;color:#555">Loading...</td></tr>';
+  container.style.display = 'block';
+
+  try {
+    const resp = await fetch('/api/backtest/markets');
+    btMarketData = await resp.json();
+    countEl.textContent = `${btMarketData.length} resolved market(s)`;
+
+    if (btMarketData.length === 0) {
+      body.innerHTML = '<tr><td colspan="7" style="padding:20px;text-align:center;color:#555">No resolved markets</td></tr>';
+      return;
+    }
+
+    body.innerHTML = btMarketData.map((m, i) => `
+      <tr>
+        <td style="padding:4px 8px;border-bottom:1px solid #0f0f18"><input type="checkbox" class="bt-check" data-cid="${m.condition_id}" checked></td>
+        <td style="padding:4px 8px;border-bottom:1px solid #0f0f18">${m.coin}</td>
+        <td style="padding:4px 8px;border-bottom:1px solid #0f0f18"><span class="tf pm">${m.timeframe}</span></td>
+        <td style="padding:4px 8px;border-bottom:1px solid #0f0f18;max-width:300px;overflow:hidden;text-overflow:ellipsis" title="${(m.question||'').replace(/"/g,'&quot;')}">${m.question || '—'}</td>
+        <td style="padding:4px 8px;border-bottom:1px solid #0f0f18">${m.end_date || '—'}</td>
+        <td style="padding:4px 8px;border-bottom:1px solid #0f0f18;color:${m.outcome === 'Up' ? '#22c55e' : '#ef4444'}">${m.outcome || '—'}</td>
+        <td style="padding:4px 8px;border-bottom:1px solid #0f0f18;color:#f59e0b">${m.snapshot_count}</td>
+      </tr>
+    `).join('');
+
+    document.getElementById('btSelectAll').checked = true;
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="7" style="padding:20px;text-align:center;color:#ef4444">Failed to load markets</td></tr>';
+  }
+}
+
+function toggleBtSelectAll() {
+  const checked = document.getElementById('btSelectAll').checked;
+  document.querySelectorAll('.bt-check').forEach(cb => cb.checked = checked);
+}
+
+function exportBacktest() {
+  const fmt = document.getElementById('btFormat').value;
+  const scope = document.getElementById('btScope').value;
+  const statusEl = document.getElementById('btStatus');
+
+  let url = `/export/backtest?format=${fmt}`;
+
+  if (scope === 'selected') {
+    const checked = document.querySelectorAll('.bt-check:checked');
+    if (checked.length === 0) {
+      statusEl.textContent = 'No markets selected — click "List Markets" first';
+      statusEl.style.color = '#ef4444';
+      return;
+    }
+    const ids = Array.from(checked).map(cb => cb.dataset.cid).join(',');
+    url += `&condition_ids=${encodeURIComponent(ids)}`;
+  }
+
+  statusEl.textContent = 'Generating export...';
+  statusEl.style.color = '#f59e0b';
+  window.location.href = url;
+
+  // Reset status after a delay (download starts in background)
+  setTimeout(() => {
+    statusEl.textContent = 'Download started';
+    statusEl.style.color = '#22c55e';
+  }, 2000);
 }
 
 loadStats();
