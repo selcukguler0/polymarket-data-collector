@@ -145,7 +145,8 @@ def get_db() -> sqlite3.Connection:
             usdc_size         REAL,                -- USDC amount
             outcome_index     INTEGER,             -- 0=Up/Yes  1=Down/No
             asset_id          TEXT,                -- token asset ID
-            market_end_ts     INTEGER,             -- market expiry Unix ms (from slug)
+            market_start_ts   INTEGER,             -- market start Unix ms (from slug)
+            market_end_ts     INTEGER,             -- market expiry Unix ms (start + duration)
             secs_to_expiry    INTEGER,             -- seconds from trade to expiry
             wallet_trade_seq  INTEGER,             -- this wallet's Nth trade in this market
             -- enrichment at collection time
@@ -162,6 +163,7 @@ def get_db() -> sqlite3.Connection:
     existing = {r[1] for r in conn.execute("PRAGMA table_info(wallet_trades)")}
     for col, defn in [
         ("timeframe",        "TEXT"),
+        ("market_start_ts",  "INTEGER"),
         ("market_end_ts",    "INTEGER"),
         ("secs_to_expiry",   "INTEGER"),
         ("wallet_trade_seq", "INTEGER"),
@@ -191,6 +193,7 @@ def get_db() -> sqlite3.Connection:
             total_bought    REAL,
             realized_pnl    REAL,
             end_date        TEXT,
+            market_start_ts INTEGER,
             market_end_ts   INTEGER,
             secs_to_expiry  INTEGER,               -- seconds until this market closes
             binance_price   REAL,
@@ -202,9 +205,10 @@ def get_db() -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_condition ON wallet_positions(condition_id)")
     existing_wp = {r[1] for r in conn.execute("PRAGMA table_info(wallet_positions)")}
     for col, defn in [
-        ("timeframe",      "TEXT"),
-        ("market_end_ts",  "INTEGER"),
-        ("secs_to_expiry", "INTEGER"),
+        ("timeframe",       "TEXT"),
+        ("market_start_ts", "INTEGER"),
+        ("market_end_ts",   "INTEGER"),
+        ("secs_to_expiry",  "INTEGER"),
     ]:
         if col not in existing_wp:
             conn.execute(f"ALTER TABLE wallet_positions ADD COLUMN {col} {defn}")
@@ -307,20 +311,27 @@ def detect_coin(title: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def extract_slug_meta(slug: str) -> tuple[str | None, int | None]:
+_DURATION_SECS = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
+
+
+def extract_slug_meta(slug: str) -> tuple[str | None, int | None, int | None]:
     """
     Parse slug like 'btc-updown-5m-1773060900'.
-    Returns (timeframe, market_end_ts_ms).
+    The timestamp in the slug is the market START time, not end.
+    Returns (timeframe, start_ts_ms, end_ts_ms).
     """
-    tf  = None
-    end = None
+    tf    = None
+    start = None
+    end   = None
     m = re.search(r'-(5m|15m|1h|1d)-', slug)
     if m:
         tf = m.group(1)
     m = re.search(r'-(\d{10})$', slug)
     if m:
-        end = int(m.group(1)) * 1000
-    return tf, end
+        start = int(m.group(1)) * 1000
+    if start is not None and tf is not None:
+        end = start + _DURATION_SECS[tf] * 1000
+    return tf, start, end
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -432,6 +443,11 @@ def _enrich_and_build_rows(raw_trades: list[dict], wallet: str) -> list[tuple]:
     seq_counter: dict[str, int] = {}
     rows = []
 
+    # Prices from Binance/Gamma are only meaningful for real-time collection.
+    # For backfilled trades (older than 5 min), these would be current prices,
+    # not prices at trade time — so we set them to None.
+    REALTIME_THRESHOLD_MS = 5 * 60 * 1000
+
     for t in raw_trades:
         tx = t.get("transactionHash") or ""
         if not tx or t.get("type") != "TRADE":
@@ -441,16 +457,22 @@ def _enrich_and_build_rows(raw_trades: list[dict], wallet: str) -> list[tuple]:
         condition_id = t.get("conditionId") or ""
         slug         = t.get("slug") or t.get("eventSlug") or ""
         coin, symbol = detect_coin(title)
-        tf, end_ts   = extract_slug_meta(slug)
+        tf, start_ts, end_ts = extract_slug_meta(slug)
         trade_ts     = int(t.get("timestamp") or 0) * 1000
         secs_to_exp  = int((end_ts - trade_ts) / 1000) if end_ts and trade_ts else None
 
-        key = (symbol, slug)
-        if key not in price_cache:
-            bp   = get_binance_price(symbol) if symbol else None
-            u, d = get_market_prices(slug)   if slug   else (None, None)
-            price_cache[key] = (bp, u, d)
-        bp, up, down = price_cache[key]
+        is_realtime = (collected_ts - trade_ts) < REALTIME_THRESHOLD_MS if trade_ts else False
+
+        if is_realtime:
+            key = (symbol, slug)
+            if key not in price_cache:
+                bp   = get_binance_price(symbol) if symbol else None
+                u, d = get_market_prices(slug)   if slug   else (None, None)
+                price_cache[key] = (bp, u, d)
+            bp, up, down = price_cache[key]
+        else:
+            # Historical trade — current prices are not meaningful
+            bp, up, down = None, None, None
 
         seq_counter[condition_id] = seq_counter.get(condition_id, 0) + 1
 
@@ -469,6 +491,7 @@ def _enrich_and_build_rows(raw_trades: list[dict], wallet: str) -> list[tuple]:
             float(t.get("usdcSize") or 0),
             t.get("outcomeIndex"),
             t.get("asset"),
+            start_ts,
             end_ts,
             secs_to_exp,
             seq_counter[condition_id],
@@ -488,9 +511,9 @@ def _insert_trades(conn: sqlite3.Connection, rows: list[tuple]) -> int:
         INSERT OR IGNORE INTO wallet_trades
         (tx_hash, wallet_address, trade_ts, condition_id, market_title, coin,
          timeframe, outcome, side, price, size, usdc_size, outcome_index, asset_id,
-         market_end_ts, secs_to_expiry, wallet_trade_seq,
+         market_start_ts, market_end_ts, secs_to_expiry, wallet_trade_seq,
          collected_ts, binance_price, up_price, down_price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
     conn.commit()
     return len(rows)
@@ -603,7 +626,7 @@ def snapshot_positions(conn: sqlite3.Connection, wallet: str) -> int:
         condition_id = pos.get("conditionId") or ""
         slug         = pos.get("slug") or pos.get("eventSlug") or ""
         coin, symbol = detect_coin(title)
-        tf, end_ts   = extract_slug_meta(slug)
+        tf, start_ts, end_ts = extract_slug_meta(slug)
         secs_left    = int(end_ts / 1000 - now_s) if end_ts else None
 
         key = (symbol, slug)
@@ -627,6 +650,7 @@ def snapshot_positions(conn: sqlite3.Connection, wallet: str) -> int:
             float(pos.get("totalBought")   or 0),
             float(pos.get("realizedPnl")   or 0),
             pos.get("endDate"),
+            start_ts,
             end_ts,
             secs_left,
             bp, up, down,
@@ -638,8 +662,9 @@ def snapshot_positions(conn: sqlite3.Connection, wallet: str) -> int:
             (snapshot_ts, wallet_address, condition_id, market_title, coin, timeframe,
              outcome, size, avg_price, cur_price, cash_pnl, percent_pnl,
              initial_value, current_value, total_bought, realized_pnl, end_date,
-             market_end_ts, secs_to_expiry, binance_price, up_price, down_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             market_start_ts, market_end_ts, secs_to_expiry,
+             binance_price, up_price, down_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         conn.commit()
 
