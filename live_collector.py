@@ -58,12 +58,13 @@ OUTCOME_LOOKBACK     = 300    # check markets that ended within last 5 min
 CSV_FLUSH_INTERVAL   = 30     # seconds between CSV flushes
 BOOK_LEVELS          = 5      # top N bid/ask levels to store
 
-# ── Coin keywords for market discovery ────────────────────────────────────────
-COIN_TAGS = {
-    "bitcoin":  "BTC",
-    "ethereum": "ETH",
-    "solana":   "SOL",
+# ── Coin config for market discovery (matches collector.py approach) ───────────
+COINS = {
+    "BTC": {"gamma_tag": "bitcoin", "prefix": "bitcoin up or down"},
+    "ETH": {"gamma_tag": "ethereum", "prefix": "ethereum up or down"},
+    "SOL": {"gamma_tag": "solana",  "prefix": "solana up or down"},
 }
+GAMMA_EVENTS_URL = f"{GAMMA_API}/events"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Shared state
@@ -195,26 +196,6 @@ def init_csv_writers():
 #  Market Discovery
 # ═════════════════════════════════════════════════════════════════════════════
 
-_TIMEFRAME_RE = re.compile(
-    r'(\d+)\s*(?:minute|min|m)|(\d+)\s*(?:hour|hr|h)|(\d+)\s*(?:day|d)',
-    re.IGNORECASE,
-)
-_DURATION_SECS = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
-
-
-def _parse_timeframe(question: str) -> str | None:
-    """Extract timeframe from question text."""
-    q = question.lower()
-    if "5 min" in q or "5m" in q or "five min" in q:
-        return "5m"
-    if "15 min" in q or "15m" in q or "fifteen min" in q:
-        return "15m"
-    if "1 hour" in q or "1h" in q or "one hour" in q or "60 min" in q:
-        return "1h"
-    if "1 day" in q or "1d" in q or "24 hour" in q or "24h" in q:
-        return "1d"
-    return None
-
 
 def _parse_end_date_ms(end_date_str: str) -> int:
     if not end_date_str:
@@ -228,86 +209,154 @@ def _parse_end_date_ms(end_date_str: str) -> int:
     return 0
 
 
+def _parse_duration_minutes(question: str) -> int | None:
+    """Parse duration from market question text (same logic as collector.py)."""
+    q = question.lower()
+    m = re.search(r'(\d+)\s*m(?:in)?(?:ute)?s?\b', q)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)\s*h(?:our)?s?\b', q)
+    if m:
+        return int(m.group(1)) * 60
+    m = re.search(r'(\d+)\s*d(?:ay)?s?\b', q)
+    if m:
+        return int(m.group(1)) * 1440
+    # Time range like "3:00 PM to 3:05 PM" → 5 mins
+    range_pat = r'(\d{1,2}):(\d{2})\s*(am|pm)\s*(?:to|-)\s*(\d{1,2}):(\d{2})\s*(am|pm)'
+    m = re.search(range_pat, q, re.IGNORECASE)
+    if m:
+        h1, m1, ap1 = int(m.group(1)), int(m.group(2)), m.group(3).lower()
+        h2, m2, ap2 = int(m.group(4)), int(m.group(5)), m.group(6).lower()
+        def to_min(h, mn, ap):
+            if ap == "pm" and h != 12: h += 12
+            elif ap == "am" and h == 12: h = 0
+            return h * 60 + mn
+        t1, t2 = to_min(h1, m1, ap1), to_min(h2, m2, ap2)
+        diff = t2 - t1 if t2 > t1 else t2 + 1440 - t1
+        return diff
+    return None
+
+
+_DURATION_TO_TF = {5: "5m", 15: "15m", 60: "1h", 1440: "1d"}
+
+
 def discover_markets():
-    """Find active BTC/ETH/SOL Up/Down 5m and 15m markets via Gamma API."""
+    """Find active Up/Down 5m and 15m markets via Gamma Events API.
+
+    Uses the same approach as collector.py: query /events with tag_slug,
+    iterate nested markets, filter by question prefix.
+    """
     now_ms = int(time.time() * 1000)
+    now_utc = datetime.now(timezone.utc)
     new_count = 0
 
-    for tag, coin in COIN_TAGS.items():
-        data = _req(f"{GAMMA_API}/markets", {
-            "tag": tag,
-            "closed": "false",
-            "limit": 50,
-        })
-        if not isinstance(data, list):
-            continue
-
-        for mkt in data:
-            question = (mkt.get("question") or "").lower()
-            if "up" not in question or "down" not in question:
+    for coin, info in COINS.items():
+        try:
+            events = _req(GAMMA_EVENTS_URL, {
+                "tag_slug": info["gamma_tag"],
+                "active": "true",
+                "closed": "false",
+                "limit": 200,
+            })
+            if not isinstance(events, list):
+                log.warning(f"[discovery] No events for {coin}")
                 continue
 
-            condition_id = mkt.get("conditionId") or ""
-            if not condition_id:
-                continue
+            for event in events:
+                event_markets = event.get("markets") or []
+                for mkt in event_markets:
+                    question = mkt.get("question", "")
+                    if not question.lower().startswith(info["prefix"]):
+                        continue
+                    if not mkt.get("active", False):
+                        continue
 
-            tf = _parse_timeframe(mkt.get("question") or "")
-            if tf not in ("5m", "15m"):
-                continue
+                    # Skip expired
+                    end_date_str = mkt.get("endDate", "")
+                    if end_date_str:
+                        try:
+                            end_dt = datetime.fromisoformat(
+                                end_date_str.replace("Z", "+00:00")
+                            )
+                            if end_dt < now_utc:
+                                continue
+                        except ValueError:
+                            pass
 
-            end_date = mkt.get("endDate") or ""
-            end_ms = _parse_end_date_ms(end_date)
+                    # Parse clobTokenIds (may be JSON string or list)
+                    raw_ids = mkt.get("clobTokenIds", "[]")
+                    if isinstance(raw_ids, str):
+                        try:
+                            token_ids = json.loads(raw_ids)
+                        except json.JSONDecodeError:
+                            continue
+                    else:
+                        token_ids = raw_ids
+                    if not token_ids or len(token_ids) < 2:
+                        continue
 
-            # Skip already expired markets
-            if end_ms and end_ms < now_ms:
-                continue
+                    condition_id = mkt.get("conditionId", "")
+                    if not condition_id:
+                        continue
 
-            # Parse token IDs
-            outcomes = json.loads(mkt.get("outcomes") or "[]")
-            clob_ids = json.loads(mkt.get("clobTokenIds") or "[]")
-            if len(outcomes) < 2 or len(clob_ids) < 2:
-                continue
+                    # Parse timeframe from question
+                    duration_mins = _parse_duration_minutes(question)
+                    tf = _DURATION_TO_TF.get(duration_mins)
+                    if tf not in ("5m", "15m"):
+                        continue
 
-            # Map outcomes to token IDs
-            token_up = None
-            token_down = None
-            for i, o in enumerate(outcomes):
-                ol = o.lower()
-                if ol in ("up", "yes"):
-                    token_up = clob_ids[i]
-                elif ol in ("down", "no"):
-                    token_down = clob_ids[i]
-            if not token_up or not token_down:
-                continue
+                    # Parse outcomes (may be JSON string or list)
+                    raw_outcomes = mkt.get("outcomes", "[]")
+                    if isinstance(raw_outcomes, str):
+                        try:
+                            outcomes = json.loads(raw_outcomes)
+                        except json.JSONDecodeError:
+                            outcomes = []
+                    else:
+                        outcomes = raw_outcomes
 
-            slug = mkt.get("slug") or mkt.get("conditionId") or ""
+                    # Map outcomes to token IDs
+                    token_up = token_ids[0]   # First is Up by convention
+                    token_down = token_ids[1]  # Second is Down
+                    # But verify if outcome labels exist
+                    if len(outcomes) >= 2:
+                        for i, o in enumerate(outcomes):
+                            ol = o.lower()
+                            if ol in ("up", "yes") and i < len(token_ids):
+                                token_up = token_ids[i]
+                            elif ol in ("down", "no") and i < len(token_ids):
+                                token_down = token_ids[i]
 
-            info = {
-                "condition_id": condition_id,
-                "coin": coin,
-                "timeframe": tf,
-                "question": mkt.get("question") or "",
-                "slug": slug,
-                "token_up": token_up,
-                "token_down": token_down,
-                "end_date": end_date,
-                "end_ts_ms": end_ms,
-            }
+                    end_ms = _parse_end_date_ms(end_date_str)
+                    slug = mkt.get("slug") or condition_id
 
-            with active_markets_lock:
-                if condition_id not in active_markets:
-                    active_markets[condition_id] = info
-                    new_count += 1
-                    # Log to CSV
-                    markets_csv.write_row([
-                        now_ms, condition_id, slug,
-                        coin, tf, mkt.get("question") or "",
-                        token_up, token_down,
-                        end_date, end_ms,
-                    ])
-                else:
-                    # Update end time if changed
-                    active_markets[condition_id].update(info)
+                    mkt_info = {
+                        "condition_id": condition_id,
+                        "coin": coin,
+                        "timeframe": tf,
+                        "question": question,
+                        "slug": slug,
+                        "token_up": token_up,
+                        "token_down": token_down,
+                        "end_date": end_date_str,
+                        "end_ts_ms": end_ms,
+                    }
+
+                    with active_markets_lock:
+                        if condition_id not in active_markets:
+                            active_markets[condition_id] = mkt_info
+                            new_count += 1
+                            markets_csv.write_row([
+                                now_ms, condition_id, slug,
+                                coin, tf, question,
+                                token_up, token_down,
+                                end_date_str, end_ms,
+                            ])
+                        else:
+                            active_markets[condition_id].update(mkt_info)
+
+        except Exception as e:
+            log.error(f"[discovery] Error for {coin}: {e}")
 
     if new_count:
         log.info(f"[discovery] +{new_count} new markets (total active: {len(active_markets)})")

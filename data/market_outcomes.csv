@@ -1,0 +1,1 @@
+condition_id,market_slug,token_id_up,token_id_down,market_end_ts_ms,resolution_outcome,resolution_timestamp_ms,final_up_price,final_down_price,coin,timeframe,question
