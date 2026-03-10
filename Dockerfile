@@ -12,4 +12,4 @@ RUN mkdir -p /app/data
 EXPOSE 8050
 
 # Runs both collector (background) and dashboard (foreground)
-CMD ["sh", "-c", "python collector.py & python wallet_collector.py & python -m gunicorn -w 2 -b 0.0.0.0:8050 dashboard:app"]
+CMD ["sh", "-c", "python collector.py & python live_collector.py & python -m gunicorn -w 2 -b 0.0.0.0:8050 dashboard:app"]

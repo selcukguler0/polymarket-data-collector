@@ -67,23 +67,6 @@
   .purple { color: #a78bfa; }
   .preview .empty { padding: 40px; text-align: center; color: #444; }
 
-  /* Wallet section */
-  .wallet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin-bottom: 16px; }
-  .wallet-card { background: #111118; border: 1px solid #1a1a2e; border-radius: 8px; padding: 12px 14px; }
-  .wallet-card .wname { font-size: 12px; font-weight: 600; color: #fff; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: center; }
-  .wallet-card .waddr { font-size: 10px; color: #444; margin-bottom: 6px; }
-  .wallet-card .wmeta { font-size: 11px; color: #555; line-height: 1.7; }
-  .wallet-card .wmeta .hi { color: #f59e0b; font-weight: 500; }
-  .badge-done { font-size: 9px; padding: 2px 6px; border-radius: 3px; background: #14532d; color: #22c55e; }
-  .badge-pending { font-size: 9px; padding: 2px 6px; border-radius: 3px; background: #1c1c0a; color: #f59e0b; }
-
-  /* Leaderboard table */
-  .lb-table { width: 100%; border-collapse: collapse; font-size: 11px; }
-  .lb-table th { text-align: left; padding: 8px 12px; color: #555; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #1a1a2e; position: sticky; top: 0; background: #111118; }
-  .lb-table td { padding: 6px 12px; border-bottom: 1px solid #0f0f18; }
-  .lb-table tr:hover td { background: #0f0f1a; }
-  .rank-num { color: #555; font-size: 12px; font-weight: 600; }
-  .rank-num.top3 { color: #f59e0b; }
   .pnl-pos { color: #22c55e; }
   .pnl-neg { color: #ef4444; }
 </style>
@@ -108,74 +91,19 @@
   <div class="section-title">Extra Data</div>
   <div id="extras" class="extras"></div>
 
-  <!-- Wallet Intelligence -->
-  <div class="section-title">Wallet Intelligence — Top 20 Traders</div>
-  <div id="walletSummary" class="extras" style="margin-bottom:12px"></div>
-  <div id="walletGrid" class="wallet-grid"></div>
-
-  <!-- Leaderboard -->
+  <!-- Live Collector Data -->
+  <div class="section-title">Live Collector — Books, Trades, Outcomes</div>
+  <div id="liveStats" class="extras" style="margin-bottom:12px"></div>
   <div class="controls" style="margin-bottom:24px">
     <h2 style="display:flex;justify-content:space-between;align-items:center">
-      Weekly Crypto Leaderboard
-      <span style="display:flex;gap:8px">
-        <button class="btn btn-ghost" style="font-size:11px;padding:4px 12px" onclick="loadLeaderboard()">Refresh</button>
-        <a href="/download/leaderboard" class="btn btn-secondary" style="font-size:11px;padding:4px 12px;text-decoration:none">Download History CSV</a>
-      </span>
+      Live Collector Downloads
+      <button class="btn btn-ghost" style="font-size:11px;padding:4px 12px" onclick="loadLiveStats()">Refresh</button>
     </h2>
-    <div class="preview-scroll" style="max-height:360px;overflow-y:auto">
-      <table class="lb-table">
-        <thead><tr>
-          <th>#</th><th>Trader</th><th>Wallet</th>
-          <th>Weekly P&L</th><th>Volume</th><th>Trades Collected</th>
-        </tr></thead>
-        <tbody id="lbBody"><tr><td colspan="6" style="padding:20px;text-align:center;color:#444">Loading...</td></tr></tbody>
-      </table>
-    </div>
-    <div id="lbTimestamp" style="margin-top:8px;font-size:11px;color:#444"></div>
-  </div>
-
-  <!-- Wallet Trade Download -->
-  <div class="controls" style="margin-bottom:24px">
-    <h2>Wallet Trades — Download &amp; Preview</h2>
-    <div class="controls-row" style="margin-bottom:14px">
-      <div class="field">
-        <label>Wallet</label>
-        <select id="wWallet"><option value="">All Wallets</option></select>
-      </div>
-      <div class="field">
-        <label>Coin</label>
-        <select id="wCoin">
-          <option value="">All</option>
-          <option value="BTC">BTC</option>
-          <option value="ETH">ETH</option>
-          <option value="XRP">XRP</option>
-          <option value="SOL">SOL</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Timeframe</label>
-        <select id="wTf">
-          <option value="">All</option>
-          <option value="5m">5m</option>
-          <option value="15m">15m</option>
-          <option value="1h">1h</option>
-          <option value="1d">1d</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Outcome</label>
-        <select id="wOutcome">
-          <option value="">All</option>
-          <option value="Up">Up</option>
-          <option value="Down">Down</option>
-        </select>
-      </div>
-      <button class="btn btn-ghost" onclick="previewWalletTrades()">Preview</button>
-      <button class="btn btn-primary" onclick="downloadWalletTrades()">Download Trades CSV</button>
-      <button class="btn btn-secondary" onclick="downloadWalletPositions()">Download Positions CSV</button>
-    </div>
-    <div class="preview-scroll" style="max-height:320px;overflow-y:auto">
-      <div id="walletTradePreview"><div class="empty" style="padding:24px;text-align:center;color:#444">Click Preview to see recent trades</div></div>
+    <div class="controls-row" style="gap:10px">
+      <button class="btn btn-primary" onclick="window.location.href='/download/live/book_snapshots'">Book Snapshots CSV</button>
+      <button class="btn btn-primary" onclick="window.location.href='/download/live/live_trades'">Live Trades CSV</button>
+      <button class="btn btn-secondary" onclick="window.location.href='/download/live/market_outcomes'">Market Outcomes CSV</button>
+      <button class="btn btn-secondary" onclick="window.location.href='/download/live/active_markets'">Active Markets CSV</button>
     </div>
   </div>
 
@@ -485,149 +413,27 @@ function exportBacktest() {
   }, 2000);
 }
 
-// ── Wallet Intelligence ──
+// ── Live Collector Stats ──
 
-async function loadWalletStats() {
+async function loadLiveStats() {
   try {
-    const resp = await fetch('/api/wallet/stats');
+    const resp = await fetch('/api/live/stats');
     const data = await resp.json();
-
-    // Summary badges
-    document.getElementById('walletSummary').innerHTML = `
-      <div class="extra-badge">Wallets Tracked: <span class="num">${data.wallets.length}</span></div>
-      <div class="extra-badge">Total Trades: <span class="num">${data.total_trades.toLocaleString()}</span></div>
-      <div class="extra-badge">Open Positions: <span class="num">${data.total_open_positions.toLocaleString()}</span></div>
-      <div class="extra-badge">Leaderboard: <span class="num">${data.leaderboard_updated || '—'}</span></div>
+    document.getElementById('liveStats').innerHTML = `
+      <div class="extra-badge">Book Snapshots: <span class="num">${data.book_snapshots.rows.toLocaleString()}</span> rows (${data.book_snapshots.size_kb}KB)</div>
+      <div class="extra-badge">Live Trades: <span class="num">${data.live_trades.rows.toLocaleString()}</span> rows (${data.live_trades.size_kb}KB)</div>
+      <div class="extra-badge">Market Outcomes: <span class="num">${data.market_outcomes.rows.toLocaleString()}</span></div>
+      <div class="extra-badge">Active Markets: <span class="num">${data.active_markets.rows.toLocaleString()}</span></div>
     `;
-
-    // Wallet cards
-    const grid = document.getElementById('walletGrid');
-    grid.innerHTML = data.wallets.map(w => `
-      <div class="wallet-card">
-        <div class="wname">
-          <span>${w.username || '—'}</span>
-          <span class="${w.backfill_done ? 'badge-done' : 'badge-pending'}">${w.backfill_done ? 'synced' : 'syncing'}</span>
-        </div>
-        <div class="waddr">${w.address.slice(0,10)}...${w.address.slice(-6)}</div>
-        <div class="wmeta">
-          <span class="hi">${(w.total_trades||0).toLocaleString()}</span> trades &middot;
-          <span class="hi">${w.open_positions}</span> open<br>
-          last: ${w.last_trade || 'none'}
-        </div>
-      </div>
-    `).join('');
-
-    // Populate wallet dropdown
-    const sel = document.getElementById('wWallet');
-    const current = sel.value;
-    sel.innerHTML = '<option value="">All Wallets</option>' +
-      data.wallets.map(w => `<option value="${w.address}">${w.username || w.address.slice(0,12)+'...'}</option>`).join('');
-    sel.value = current;
-
   } catch(e) {
-    document.getElementById('walletGrid').innerHTML = '<div style="color:#444;padding:12px;font-size:12px">No wallet data yet — collector running?</div>';
+    document.getElementById('liveStats').innerHTML = '<div class="extra-badge" style="color:#444">Live collector not running or no data yet</div>';
   }
-}
-
-async function loadLeaderboard() {
-  try {
-    const resp = await fetch('/api/wallet/leaderboard');
-    const data = await resp.json();
-    const body = document.getElementById('lbBody');
-
-    if (!data.entries || data.entries.length === 0) {
-      body.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:#444">No leaderboard data yet</td></tr>';
-      return;
-    }
-
-    const ts = data.snapshot_ts ? new Date(data.snapshot_ts).toUTCString() : '';
-    document.getElementById('lbTimestamp').textContent = ts ? 'Snapshot: ' + ts : '';
-
-    body.innerHTML = data.entries.map(e => {
-      const pnlFmt = e.pnl >= 0 ? `+$${e.pnl.toLocaleString(undefined,{maximumFractionDigits:0})}` : `-$${Math.abs(e.pnl).toLocaleString(undefined,{maximumFractionDigits:0})}`;
-      const pnlCls = e.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-      const rankCls = e.rank <= 3 ? 'rank-num top3' : 'rank-num';
-      return `<tr>
-        <td><span class="${rankCls}">${e.rank}</span></td>
-        <td style="color:#fff;font-weight:500">${e.username || '—'}</td>
-        <td style="color:#444;font-size:10px">${e.wallet.slice(0,10)}...${e.wallet.slice(-6)}</td>
-        <td class="${pnlCls}">${pnlFmt}</td>
-        <td style="color:#666">$${(e.volume||0).toLocaleString(undefined,{maximumFractionDigits:0})}</td>
-        <td style="color:#f59e0b">${(e.trades_collected||0).toLocaleString()}</td>
-      </tr>`;
-    }).join('');
-  } catch(e) {
-    document.getElementById('lbBody').innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:#444">Failed to load</td></tr>';
-  }
-}
-
-async function previewWalletTrades() {
-  const wallet  = document.getElementById('wWallet').value;
-  const coin    = document.getElementById('wCoin').value;
-  const tf      = document.getElementById('wTf').value;
-  const outcome = document.getElementById('wOutcome').value;
-
-  let url = `/api/wallet/trades?limit=50`;
-  if (wallet)  url += `&wallet=${wallet}`;
-  if (coin)    url += `&coin=${coin}`;
-  if (tf)      url += `&timeframe=${tf}`;
-  if (outcome) url += `&outcome=${outcome}`;
-
-  const resp = await fetch(url);
-  const rows = await resp.json();
-  const div  = document.getElementById('walletTradePreview');
-
-  if (!rows.length) {
-    div.innerHTML = '<div class="empty" style="padding:24px;text-align:center;color:#444">No trades found</div>';
-    return;
-  }
-
-  const cols = ['time','wallet','market','coin','tf','outcome','side','price','usdc','binance_px','up_px','dn_px','secs_to_exp','seq'];
-  let html = '<table style="width:100%;border-collapse:collapse;font-size:11px"><thead><tr>';
-  cols.forEach(c => html += `<th style="padding:6px 10px;border-bottom:1px solid #1a1a2e;color:#555;font-size:10px;text-transform:uppercase;white-space:nowrap;position:sticky;top:0;background:#111118">${c}</th>`);
-  html += '</tr></thead><tbody>';
-  rows.forEach(r => {
-    html += '<tr>';
-    cols.forEach(c => {
-      let v = r[c], cls = '';
-      if (c === 'outcome') cls = v === 'Up' ? 'color:#22c55e' : 'color:#ef4444';
-      if (c === 'side')    cls = v === 'BUY' ? 'color:#22c55e' : 'color:#888';
-      if (c === 'pnl')     cls = (v||0) >= 0 ? 'color:#22c55e' : 'color:#ef4444';
-      if (c === 'market')  v = (v||'').slice(0, 40) + ((v||'').length > 40 ? '…' : '');
-      if (c === 'wallet')  v = (v||'').slice(0,8)+'...';
-      if (typeof v === 'number' && !Number.isInteger(v)) v = v.toFixed(4);
-      html += `<td style="padding:5px 10px;border-bottom:1px solid #0f0f18;white-space:nowrap;${cls}">${v ?? '—'}</td>`;
-    });
-    html += '</tr>';
-  });
-  html += '</tbody></table>';
-  div.innerHTML = html;
-}
-
-function downloadWalletTrades() {
-  const wallet = document.getElementById('wWallet').value;
-  const coin   = document.getElementById('wCoin').value;
-  const tf     = document.getElementById('wTf').value;
-  let url = '/download/wallet_trades?';
-  if (wallet) url += `wallet=${wallet}&`;
-  if (coin)   url += `coin=${coin}&`;
-  if (tf)     url += `timeframe=${tf}`;
-  window.location.href = url;
-}
-
-function downloadWalletPositions() {
-  const wallet = document.getElementById('wWallet').value;
-  let url = '/download/wallet_positions?latest=true';
-  if (wallet) url += `&wallet=${wallet}`;
-  window.location.href = url;
 }
 
 loadStats();
-loadWalletStats();
-loadLeaderboard();
+loadLiveStats();
 setInterval(loadStats, 30000);
-setInterval(loadWalletStats, 60000);
-setInterval(loadLeaderboard, 120000);
+setInterval(loadLiveStats, 30000);
 onDatasetChange();
 </script>
 </body>

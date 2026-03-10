@@ -597,259 +597,66 @@ def download():
     )
 
 
-# ── Wallet / Leaderboard API ──
+# ── Live Collector CSV Downloads ──
 
-@app.route("/api/wallet/stats")
-def wallet_stats():
-    conn = get_db()
-    wallets = conn.execute("""
-        SELECT tw.wallet_address, tw.username, tw.source, tw.backfill_done,
-               tw.total_trades, tw.last_trade_ts,
-               COUNT(wp.id) as position_count
-        FROM tracked_wallets tw
-        LEFT JOIN wallet_positions wp
-            ON wp.wallet_address = tw.wallet_address
-            AND wp.snapshot_ts = (
-                SELECT MAX(snapshot_ts) FROM wallet_positions wp2
-                WHERE wp2.wallet_address = tw.wallet_address
-            )
-        GROUP BY tw.wallet_address
-        ORDER BY tw.total_trades DESC
-    """).fetchall()
+LIVE_DATA_DIR = Path(__file__).parent / "data"
 
-    trade_total = conn.execute("SELECT COUNT(*) FROM wallet_trades").fetchone()[0]
-    position_total = conn.execute("SELECT COUNT(DISTINCT wallet_address||condition_id) FROM wallet_positions WHERE snapshot_ts = (SELECT MAX(snapshot_ts) FROM wallet_positions)").fetchone()[0]
-    lb_ts = conn.execute("SELECT MAX(snapshot_ts) FROM leaderboard_snapshots").fetchone()[0]
-    pnl_total = conn.execute("SELECT COUNT(*) FROM wallet_pnl_snapshots").fetchone()[0]
-    conn.close()
+def _serve_csv_file(filename: str, display_name: str):
+    """Serve a CSV file from the data directory as a download."""
+    path = LIVE_DATA_DIR / filename
+    if not path.exists() or path.stat().st_size == 0:
+        return jsonify({"error": f"No {display_name} data yet — is live_collector running?"}), 404
+    with open(path, "r") as f:
+        content = f.read()
+    return Response(
+        content,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
-    def fmt_ts(ms):
-        if not ms:
-            return None
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+@app.route("/api/live/stats")
+def live_stats():
+    """Stats for live collector CSV files."""
+    def file_info(name):
+        path = LIVE_DATA_DIR / name
+        if not path.exists():
+            return {"rows": 0, "size_kb": 0}
+        size = path.stat().st_size
+        # Count lines (minus header)
+        try:
+            with open(path, "r") as f:
+                lines = sum(1 for _ in f) - 1
+        except Exception:
+            lines = 0
+        return {"rows": max(lines, 0), "size_kb": size // 1024}
 
     return jsonify({
-        "total_trades": trade_total,
-        "total_open_positions": position_total,
-        "total_pnl_snapshots": pnl_total,
-        "leaderboard_updated": fmt_ts(lb_ts),
-        "wallets": [{
-            "address": r["wallet_address"],
-            "username": r["username"],
-            "source": r["source"],
-            "backfill_done": bool(r["backfill_done"]),
-            "total_trades": r["total_trades"] or 0,
-            "last_trade": fmt_ts(r["last_trade_ts"]),
-            "open_positions": r["position_count"] or 0,
-        } for r in wallets]
+        "book_snapshots": file_info("book_snapshots.csv"),
+        "live_trades": file_info("live_trades.csv"),
+        "market_outcomes": file_info("market_outcomes.csv"),
+        "active_markets": file_info("active_markets.csv"),
     })
 
 
-@app.route("/api/wallet/leaderboard")
-def wallet_leaderboard():
-    conn = get_db()
-    ts = conn.execute("SELECT MAX(snapshot_ts) FROM leaderboard_snapshots").fetchone()[0]
-    if not ts:
-        conn.close()
-        return jsonify([])
-    rows = conn.execute("""
-        SELECT rank, wallet_address, username, pnl, volume, realized, unrealized
-        FROM leaderboard_snapshots WHERE snapshot_ts = ?
-        ORDER BY rank ASC
-    """, (ts,)).fetchall()
-    # Attach trade count from wallet_trades
-    result = []
-    for r in rows:
-        trades = conn.execute(
-            "SELECT COUNT(*) FROM wallet_trades WHERE wallet_address = ?",
-            (r["wallet_address"],)
-        ).fetchone()[0]
-        result.append({
-            "rank": r["rank"],
-            "wallet": r["wallet_address"],
-            "username": r["username"],
-            "pnl": r["pnl"],
-            "volume": r["volume"],
-            "trades_collected": trades,
-        })
-    conn.close()
-    return jsonify({"snapshot_ts": ts, "entries": result})
+@app.route("/download/live/book_snapshots")
+def download_book_snapshots():
+    return _serve_csv_file("book_snapshots.csv", "book snapshots")
 
 
-@app.route("/api/wallet/trades")
-def wallet_trades_api():
-    wallet  = request.args.get("wallet")
-    coin    = request.args.get("coin")
-    tf      = request.args.get("timeframe")
-    outcome = request.args.get("outcome")
-    limit   = int(request.args.get("limit", 50))
-    conn    = get_db()
-
-    q = "SELECT * FROM wallet_trades WHERE 1=1"
-    p: list = []
-    if wallet:
-        q += " AND wallet_address = ?"; p.append(wallet)
-    if coin:
-        q += " AND coin = ?"; p.append(coin)
-    if tf:
-        q += " AND timeframe = ?"; p.append(tf)
-    if outcome:
-        q += " AND outcome = ?"; p.append(outcome)
-    q += f" ORDER BY trade_ts DESC LIMIT {limit}"
-
-    rows = conn.execute(q, p).fetchall()
-    conn.close()
-
-    def fmt(ms):
-        if not ms: return None
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    return jsonify([{
-        "time": fmt(r["trade_ts"]),
-        "wallet": r["wallet_address"],
-        "market": r["market_title"],
-        "coin": r["coin"],
-        "tf": r["timeframe"],
-        "outcome": r["outcome"],
-        "side": r["side"],
-        "price": r["price"],
-        "usdc": r["usdc_size"],
-        "binance_px": r["binance_price"],
-        "up_px": r["up_price"],
-        "dn_px": r["down_price"],
-        "secs_to_exp": r["secs_to_expiry"],
-        "seq": r["wallet_trade_seq"],
-    } for r in rows])
+@app.route("/download/live/live_trades")
+def download_live_trades():
+    return _serve_csv_file("live_trades.csv", "live trades")
 
 
-# ── Wallet Downloads ──
-
-@app.route("/download/wallet_trades")
-def download_wallet_trades():
-    wallet  = request.args.get("wallet")
-    coin    = request.args.get("coin")
-    tf      = request.args.get("timeframe")
-    conn    = get_db()
-
-    q = "SELECT * FROM wallet_trades WHERE 1=1"
-    p: list = []
-    if wallet:
-        q += " AND wallet_address = ?"; p.append(wallet)
-    if coin and coin != "ALL":
-        q += " AND coin = ?"; p.append(coin)
-    if tf and tf != "all":
-        q += " AND timeframe = ?"; p.append(tf)
-    q += " ORDER BY wallet_address, trade_ts ASC"
-
-    rows = conn.execute(q, p).fetchall()
-    conn.close()
-
-    out = io.StringIO()
-    w   = csv.writer(out)
-    w.writerow([
-        "wallet_address", "username",
-        "trade_time_utc", "trade_ts_ms",
-        "condition_id", "market_title", "coin", "timeframe",
-        "outcome", "side", "price", "size", "usdc_size",
-        "outcome_index", "market_end_ts_ms",
-        "secs_to_expiry", "wallet_trade_seq",
-        "binance_price", "up_price", "down_price",
-        "tx_hash",
-    ])
-
-    # Build username lookup
-    uconn = get_db()
-    umap  = {r[0]: r[1] for r in uconn.execute("SELECT wallet_address, username FROM tracked_wallets").fetchall()}
-    uconn.close()
-
-    def fmt(ms):
-        if not ms: return ""
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    for r in rows:
-        w.writerow([
-            r["wallet_address"],
-            umap.get(r["wallet_address"], ""),
-            fmt(r["trade_ts"]),
-            r["trade_ts"],
-            r["condition_id"], r["market_title"], r["coin"], r["timeframe"],
-            r["outcome"], r["side"], r["price"], r["size"], r["usdc_size"],
-            r["outcome_index"], r["market_end_ts"],
-            r["secs_to_expiry"], r["wallet_trade_seq"],
-            r["binance_price"], r["up_price"], r["down_price"],
-            r["tx_hash"],
-        ])
-
-    name = f"wallet_trades_{wallet[:8] if wallet else 'ALL'}_{coin or 'ALL'}_{tf or 'all'}.csv"
-    return Response(out.getvalue(), mimetype="text/csv",
-                    headers={"Content-Disposition": f"attachment; filename={name}"})
+@app.route("/download/live/market_outcomes")
+def download_market_outcomes():
+    return _serve_csv_file("market_outcomes.csv", "market outcomes")
 
 
-@app.route("/download/wallet_positions")
-def download_wallet_positions():
-    wallet = request.args.get("wallet")
-    latest_only = request.args.get("latest", "true") == "true"
-    conn   = get_db()
-
-    q = "SELECT * FROM wallet_positions WHERE 1=1"
-    p: list = []
-    if wallet:
-        q += " AND wallet_address = ?"; p.append(wallet)
-    if latest_only:
-        max_ts = conn.execute("SELECT MAX(snapshot_ts) FROM wallet_positions" + (" WHERE wallet_address=?" if wallet else ""), p[:1] if wallet else []).fetchone()[0]
-        if max_ts:
-            q += " AND snapshot_ts = ?"; p.append(max_ts)
-    q += " ORDER BY wallet_address, snapshot_ts ASC"
-
-    rows = conn.execute(q, p).fetchall()
-    conn.close()
-
-    out = io.StringIO()
-    w   = csv.writer(out)
-    w.writerow([
-        "snapshot_time_utc", "wallet_address", "condition_id", "market_title",
-        "coin", "timeframe", "outcome", "size", "avg_price", "cur_price",
-        "cash_pnl", "percent_pnl", "initial_value", "current_value",
-        "total_bought", "realized_pnl", "end_date",
-        "secs_to_expiry", "binance_price", "up_price", "down_price",
-    ])
-
-    def fmt(ms):
-        if not ms: return ""
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    for r in rows:
-        w.writerow([
-            fmt(r["snapshot_ts"]), r["wallet_address"], r["condition_id"], r["market_title"],
-            r["coin"], r["timeframe"], r["outcome"], r["size"], r["avg_price"], r["cur_price"],
-            r["cash_pnl"], r["percent_pnl"], r["initial_value"], r["current_value"],
-            r["total_bought"], r["realized_pnl"], r["end_date"],
-            r["secs_to_expiry"], r["binance_price"], r["up_price"], r["down_price"],
-        ])
-
-    name = f"wallet_positions_{wallet[:8] if wallet else 'ALL'}.csv"
-    return Response(out.getvalue(), mimetype="text/csv",
-                    headers={"Content-Disposition": f"attachment; filename={name}"})
-
-
-@app.route("/download/leaderboard")
-def download_leaderboard():
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT snapshot_ts, rank, wallet_address, username, pnl, volume, realized, unrealized
-        FROM leaderboard_snapshots ORDER BY snapshot_ts DESC, rank ASC
-    """).fetchall()
-    conn.close()
-
-    out = io.StringIO()
-    w   = csv.writer(out)
-    w.writerow(["snapshot_time_utc", "rank", "wallet_address", "username", "pnl", "volume", "realized", "unrealized"])
-    for r in rows:
-        ts_fmt = datetime.fromtimestamp(r["snapshot_ts"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        w.writerow([ts_fmt, r["rank"], r["wallet_address"], r["username"], r["pnl"], r["volume"], r["realized"], r["unrealized"]])
-
-    return Response(out.getvalue(), mimetype="text/csv",
-                    headers={"Content-Disposition": "attachment; filename=leaderboard_history.csv"})
+@app.route("/download/live/active_markets")
+def download_active_markets():
+    return _serve_csv_file("active_markets.csv", "active markets")
 
 
 # ── Backtest Export Routes ──
