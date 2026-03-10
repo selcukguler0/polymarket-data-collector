@@ -16,9 +16,11 @@ import json
 import logging
 import os
 import re
+import ssl
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,6 +82,20 @@ recent_books_lock = threading.Lock()
 
 # Resolved markets to avoid re-checking
 resolved_set: set[str] = set()
+
+# Global counters for status line
+_stats_lock = threading.Lock()
+_stats = {
+    "books_this_cycle": 0,
+    "book_cycle_time": 0.0,
+    "ws_connected": False,
+    "trades_captured": 0,
+    "errors": 0,
+}
+
+# Token→market reverse index for fast WS lookup
+_token_index: dict[str, str] = {}  # token_id → condition_id
+_token_index_lock = threading.Lock()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -359,6 +375,7 @@ def discover_markets():
             log.error(f"[discovery] Error for {coin}: {e}")
 
     if new_count:
+        _rebuild_token_index()
         log.info(f"[discovery] +{new_count} new markets (total active: {len(active_markets)})")
 
 
@@ -401,8 +418,65 @@ def _parse_book(data: dict) -> tuple[list, list]:
     return bids, asks
 
 
+def _fetch_one_book(token_id: str, outcome: str, mkt: dict, ts: int) -> list | None:
+    """Fetch and parse one order book. Returns CSV row or None."""
+    try:
+        resp = requests.get(
+            f"{CLOB_API}/book", params={"token_id": token_id}, timeout=5
+        )
+        if resp.status_code == 429:
+            with _stats_lock:
+                _stats["errors"] += 1
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
+
+    bids, asks = _parse_book(data)
+
+    best_bid = bids[0][0] if bids else 0
+    best_ask = asks[0][0] if asks else 0
+    bid_depth_3 = sum(s for _, s in bids[:3])
+    ask_depth_3 = sum(s for _, s in asks[:3])
+    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
+    spread = best_ask - best_bid if best_bid and best_ask else 0
+
+    # Store for trade enrichment
+    with recent_books_lock:
+        recent_books[token_id] = (ts, best_bid, best_ask, mid)
+
+    row = [
+        ts, mkt["condition_id"], token_id, outcome,
+        best_bid, best_ask, bid_depth_3, ask_depth_3,
+        mid, spread,
+    ]
+    for i in range(BOOK_LEVELS):
+        if i < len(bids):
+            row.extend([bids[i][0], bids[i][1]])
+        else:
+            row.extend([0, 0])
+    for i in range(BOOK_LEVELS):
+        if i < len(asks):
+            row.extend([asks[i][0], asks[i][1]])
+        else:
+            row.extend([0, 0])
+    row.extend([mkt["coin"], mkt["timeframe"], mkt["slug"]])
+    return row
+
+
+# Track last snapshot time per condition_id for tiered intervals
+_last_book_snap: dict[str, float] = {}
+
+
 def snapshot_books():
-    """Take a snapshot of order books for all active markets."""
+    """Take concurrent snapshots of order books with tiered intervals.
+
+    STE < 120s  → every 2s  (active trading)
+    STE 120-240s → every 5s
+    STE 240-300s → every 15s
+    STE > 300s   → every 30s (far from expiry, still ~50/50)
+    """
     with active_markets_lock:
         markets = list(active_markets.values())
 
@@ -410,53 +484,69 @@ def snapshot_books():
         return
 
     ts = int(time.time() * 1000)
-    rows = []
+    now_s = ts / 1000
+
+    # Determine which markets need a snapshot this cycle
+    # Priority: close-to-expiry markets get fetched every cycle
+    # Far markets get spread across cycles (max ~40 tokens per cycle from this tier)
+    urgent = []     # STE < 120s — every 2s
+    medium = []     # STE 120-300s — every 5-15s
+    background = [] # STE > 300s — batched across cycles
 
     for mkt in markets:
-        # Skip expired
         end = mkt.get("end_ts_ms", 0)
         if end and end < ts:
             continue
 
-        for outcome, token_id in [("Up", mkt["token_up"]), ("Down", mkt["token_down"])]:
-            data = _req(f"{CLOB_API}/book", {"token_id": token_id}, timeout=5)
-            if not data:
-                continue
+        ste = (end - ts) / 1000 if end else 9999
+        cid = mkt["condition_id"]
+        last = _last_book_snap.get(cid, 0)
+        elapsed = now_s - last
 
-            bids, asks = _parse_book(data)
+        if ste < 120:
+            if elapsed >= BOOK_INTERVAL:
+                urgent.append(mkt)
+                _last_book_snap[cid] = now_s
+        elif ste < 300:
+            interval = 5 if ste < 240 else 15
+            if elapsed >= interval:
+                medium.append(mkt)
+                _last_book_snap[cid] = now_s
+        else:
+            if elapsed >= 30:
+                background.append(mkt)
 
-            best_bid = bids[0][0] if bids else 0
-            best_ask = asks[0][0] if asks else 0
-            bid_depth_3 = sum(s for _, s in bids[:3])
-            ask_depth_3 = sum(s for _, s in asks[:3])
-            mid = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
-            spread = best_ask - best_bid if best_bid and best_ask else 0
+    # Limit background batch to ~20 markets (40 tokens) per cycle
+    MAX_BG_BATCH = 20
+    bg_batch = background[:MAX_BG_BATCH]
+    for mkt in bg_batch:
+        _last_book_snap[mkt["condition_id"]] = now_s
 
-            # Store for trade enrichment
-            with recent_books_lock:
-                recent_books[token_id] = (ts, best_bid, best_ask, mid)
+    to_fetch = []
+    for mkt in urgent + medium + bg_batch:
+        to_fetch.append(("Up", mkt["token_up"], mkt))
+        to_fetch.append(("Down", mkt["token_down"], mkt))
 
-            # Build row with top 5 levels
-            row = [
-                ts, mkt["condition_id"], token_id, outcome,
-                best_bid, best_ask, bid_depth_3, ask_depth_3,
-                mid, spread,
-            ]
-            for i in range(BOOK_LEVELS):
-                if i < len(bids):
-                    row.extend([bids[i][0], bids[i][1]])
-                else:
-                    row.extend([0, 0])
-            for i in range(BOOK_LEVELS):
-                if i < len(asks):
-                    row.extend([asks[i][0], asks[i][1]])
-                else:
-                    row.extend([0, 0])
-            row.extend([mkt["coin"], mkt["timeframe"], mkt["slug"]])
-            rows.append(row)
+    if not to_fetch:
+        return
+
+    # Concurrent fetching with bounded parallelism
+    rows = []
+    with ThreadPoolExecutor(max_workers=50) as pool:
+        futures = {
+            pool.submit(_fetch_one_book, token_id, outcome, mkt, ts): (outcome, mkt)
+            for outcome, token_id, mkt in to_fetch
+        }
+        for fut in as_completed(futures):
+            row = fut.result()
+            if row:
+                rows.append(row)
 
     if rows:
         book_csv.write_rows(rows)
+
+    with _stats_lock:
+        _stats["books_this_cycle"] = len(rows)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -540,12 +630,25 @@ def _get_book_at_trade(token_id: str) -> tuple:
 
 
 def _token_to_market(token_id: str) -> dict | None:
-    """Look up market info for a token ID."""
-    with active_markets_lock:
-        for mkt in active_markets.values():
-            if mkt["token_up"] == token_id or mkt["token_down"] == token_id:
-                return mkt
+    """Look up market info for a token ID via reverse index."""
+    with _token_index_lock:
+        cid = _token_index.get(token_id)
+    if cid:
+        with active_markets_lock:
+            return active_markets.get(cid)
     return None
+
+
+def _rebuild_token_index():
+    """Rebuild token→condition_id reverse index."""
+    with active_markets_lock:
+        new_idx = {}
+        for cid, mkt in active_markets.items():
+            new_idx[mkt["token_up"]] = cid
+            new_idx[mkt["token_down"]] = cid
+    with _token_index_lock:
+        _token_index.clear()
+        _token_index.update(new_idx)
 
 
 def _token_outcome(token_id: str, mkt: dict) -> str:
@@ -580,16 +683,23 @@ def ws_trade_listener():
             continue
 
         try:
-            log.info(f"[ws] Connecting to WebSocket with {len(token_ids)} tokens...")
-            ws = websocket.create_connection(WS_URL, timeout=30)
+            log.info(f"[ws] Connecting to {WS_URL} with {len(token_ids)} tokens...")
+            ws = websocket.create_connection(
+                WS_URL, timeout=30,
+                sslopt={"cert_reqs": ssl.CERT_NONE},
+            )
+            with _stats_lock:
+                _stats["ws_connected"] = True
+            log.info("[ws] Connected OK")
 
-            # Subscribe to trade events
+            # Correct subscription format: assets_ids (plural!)
             sub_msg = json.dumps({
+                "assets_ids": token_ids,
                 "type": "market",
-                "assets_id": token_ids,
+                "custom_feature_enabled": True,
             })
             ws.send(sub_msg)
-            log.info(f"[ws] Subscribed to {len(token_ids)} token channels")
+            log.info(f"[ws] Subscribed to {len(token_ids)} tokens")
 
             last_resub = time.time()
 
@@ -600,13 +710,15 @@ def ws_trade_listener():
                     if set(new_ids) != set(token_ids):
                         token_ids = new_ids
                         ws.send(json.dumps({
+                            "assets_ids": token_ids,
                             "type": "market",
-                            "assets_id": token_ids,
+                            "custom_feature_enabled": True,
                         }))
                         log.info(f"[ws] Resubscribed with {len(token_ids)} tokens")
                     last_resub = time.time()
 
                 try:
+                    ws.settimeout(5)
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
                     continue
@@ -615,22 +727,26 @@ def ws_trade_listener():
                     continue
 
                 try:
-                    msgs = json.loads(raw)
+                    data = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
 
-                # Handle both single message and array
-                if isinstance(msgs, dict):
-                    msgs = [msgs]
-                if not isinstance(msgs, list):
+                # Messages come as arrays or single dicts
+                if isinstance(data, dict):
+                    items = [data]
+                elif isinstance(data, list):
+                    items = data
+                else:
                     continue
 
-                for msg in msgs:
-                    event_type = msg.get("event_type") or msg.get("type") or ""
-                    if event_type not in ("trade", "last_trade_price"):
+                for msg in items:
+                    if not isinstance(msg, dict):
+                        continue
+                    event_type = msg.get("event_type", "")
+                    if event_type != "last_trade_price":
                         continue
 
-                    token_id = msg.get("asset_id") or msg.get("token_id") or ""
+                    token_id = msg.get("asset_id", "")
                     if not token_id:
                         continue
 
@@ -639,27 +755,38 @@ def ws_trade_listener():
                         continue
 
                     outcome = _token_outcome(token_id, mkt)
-                    ts = int(float(msg.get("timestamp", 0)) * 1000) or int(time.time() * 1000)
+                    # timestamp is already in milliseconds
+                    ts = int(msg.get("timestamp", 0)) or int(time.time() * 1000)
                     side = msg.get("side", "").upper()
                     price = float(msg.get("price", 0))
                     size = float(msg.get("size", 0))
-                    trade_id = msg.get("id") or msg.get("trade_id") or ""
-                    maker = msg.get("maker_address") or ""
-                    taker = msg.get("taker_address") or ""
+                    trade_id = msg.get("transaction_hash", "")
 
                     # Enrich with book state
                     bb, ba, bm = _get_book_at_trade(token_id)
+                    # Compute spread and seconds since last book snap
+                    book_spread = round(ba - bb, 6) if bb and ba else None
+                    with recent_books_lock:
+                        snap = recent_books.get(token_id)
+                    snap_age = round((ts - snap[0]) / 1000, 1) if snap else None
 
                     trades_csv.write_row([
                         ts, mkt["condition_id"], token_id, outcome,
                         side, price, size, trade_id,
-                        maker, taker,
+                        "", "",  # maker/taker not available in public channel
                         bb, ba, bm,
                         mkt["coin"], mkt["timeframe"], mkt["slug"],
                     ])
+                    trades_csv.flush()
+
+                    with _stats_lock:
+                        _stats["trades_captured"] += 1
 
         except Exception as e:
             log.error(f"[ws] WebSocket error: {e}")
+            with _stats_lock:
+                _stats["ws_connected"] = False
+                _stats["errors"] += 1
             time.sleep(5)
 
 
@@ -668,13 +795,20 @@ def ws_trade_listener():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def book_snapshot_loop():
-    """Continuously snapshot order books every BOOK_INTERVAL seconds."""
+    """Continuously snapshot order books, accounting for fetch time."""
     while True:
+        start = time.time()
         try:
             snapshot_books()
         except Exception as e:
             log.error(f"[book] Error: {e}")
-        time.sleep(BOOK_INTERVAL)
+            with _stats_lock:
+                _stats["errors"] += 1
+        elapsed = time.time() - start
+        with _stats_lock:
+            _stats["book_cycle_time"] = elapsed
+        sleep_time = max(0, BOOK_INTERVAL - elapsed)
+        time.sleep(sleep_time)
 
 
 def discovery_loop():
@@ -743,21 +877,27 @@ def run_live_collector():
         t.start()
         log.info(f"[main] Started thread: {name}")
 
-    # Keep main thread alive
+    # Keep main thread alive — status line every 10s
     try:
         while True:
-            time.sleep(60)
+            time.sleep(10)
             with active_markets_lock:
                 n = len(active_markets)
+            with _stats_lock:
+                books = _stats["books_this_cycle"]
+                cycle = _stats["book_cycle_time"]
+                ws_ok = _stats["ws_connected"]
+                trades = _stats["trades_captured"]
+                errs = _stats["errors"]
             log.info(
-                f"[main] Active: {n} markets | "
-                f"Resolved: {len(resolved_set)} | "
-                f"Books: {BOOK_CSV.stat().st_size // 1024}KB | "
-                f"Trades: {TRADES_CSV.stat().st_size // 1024 if TRADES_CSV.exists() else 0}KB"
+                f"[STATUS] active_mkts={n} | "
+                f"books_this_cycle={books} (avg {cycle:.1f}s) | "
+                f"ws_connected={ws_ok} | "
+                f"trades_captured={trades} | "
+                f"errors={errs}"
             )
     except KeyboardInterrupt:
         log.info("[main] Shutting down...")
-        # Flush all CSVs
         for w in (book_csv, trades_csv, outcomes_csv, markets_csv):
             if w:
                 w.flush()
