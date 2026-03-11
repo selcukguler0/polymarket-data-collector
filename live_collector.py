@@ -84,6 +84,7 @@ COINS = {
     "BTC": {"gamma_tag": "bitcoin", "prefix": "bitcoin up or down"},
     "ETH": {"gamma_tag": "ethereum", "prefix": "ethereum up or down"},
     "SOL": {"gamma_tag": "solana",  "prefix": "solana up or down"},
+    "XRP": {"gamma_tag": "xrp",     "prefix": "xrp up or down"},
 }
 GAMMA_EVENTS_URL = f"{GAMMA_API}/events"
 
