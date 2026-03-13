@@ -1,0 +1,1 @@
+timestamp_ms,condition_id,token_id,outcome,best_bid,best_ask,bid_depth_3,ask_depth_3,mid_price,spread,bid_1_price,bid_1_size,bid_2_price,bid_2_size,bid_3_price,bid_3_size,bid_4_price,bid_4_size,bid_5_price,bid_5_size,ask_1_price,ask_1_size,ask_2_price,ask_2_size,ask_3_price,ask_3_size,ask_4_price,ask_4_size,ask_5_price,ask_5_size,sport,event_title,team_player,market_slug

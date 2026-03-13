@@ -7,7 +7,7 @@ set -e
 # ── Remote server config ──
 SERVER="69.62.119.76"
 USER="root"
-CONTAINER="7f1b759aba30"
+CONTAINER="1d399f5713ff"
 
 # ── Paths ──
 LOCAL_DIR="${1:-./downloaded_data}"
@@ -19,6 +19,10 @@ CSV_FILES=(
     "live_trades.csv"
     "market_outcomes.csv"
     "active_markets.csv"
+    "sports_book_snapshots.csv"
+    "sports_live_trades.csv"
+    "sports_outcomes.csv"
+    "sports_markets.csv"
 )
 
 mkdir -p "$LOCAL_DIR"
