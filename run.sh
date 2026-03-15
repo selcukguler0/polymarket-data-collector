@@ -14,17 +14,22 @@ echo "Starting live supplementary collector in background..."
 python live_collector.py &
 LIVE_PID=$!
 
+echo "Starting weather collector in background..."
+python weather_collector.py &
+WEATHER_PID=$!
+
 echo "Starting dashboard on :8050..."
 python dashboard.py &
 DASHBOARD_PID=$!
 
 echo ""
-echo "  Market collector PID : $COLLECTOR_PID"
-echo "  Live collector PID   : $LIVE_PID"
-echo "  Dashboard PID        : $DASHBOARD_PID"
-echo "  Dashboard URL        : http://localhost:8050"
+echo "  Market collector PID  : $COLLECTOR_PID"
+echo "  Live collector PID    : $LIVE_PID"
+echo "  Weather collector PID : $WEATHER_PID"
+echo "  Dashboard PID         : $DASHBOARD_PID"
+echo "  Dashboard URL         : http://localhost:8050"
 echo ""
 echo "Press Ctrl+C to stop all"
 
-trap "kill $COLLECTOR_PID $LIVE_PID $DASHBOARD_PID 2>/dev/null; exit" INT TERM
+trap "kill $COLLECTOR_PID $LIVE_PID $WEATHER_PID $DASHBOARD_PID 2>/dev/null; exit" INT TERM
 wait
