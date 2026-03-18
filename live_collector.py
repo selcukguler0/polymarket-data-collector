@@ -833,18 +833,30 @@ def ws_trade_listener():
 # ═════════════════════════════════════════════════════════════════════════════
 #  On-chain enrichment (maker/taker via tx-hash receipt + Data API fallback)
 # ═════════════════════════════════════════════════════════════════════════════
+#  Enrichment: Data API (taker + tx hash) → on-chain receipt (maker)
+#
+#  Strategy:
+#   1. Data API gives us: proxyWallet (taker), transactionHash, price, size
+#   2. On-chain tx receipt gives us: maker address from OrderFilled event
+#   3. Match WS trades → Data API trades by price+size+timestamp
+#   4. Then fetch tx receipt to get maker (one RPC per unique tx hash)
+# ═════════════════════════════════════════════════════════════════════════════
 
-# Data API for fallback enrichment
 DATA_API = "https://data-api.polymarket.com"
 
-# Rate limiting for RPC and Data API
-_rpc_semaphore = threading.Semaphore(3)  # max 3 concurrent RPC calls
-_data_api_last_call = 0.0
+# Rate limiting
+_rpc_semaphore = threading.Semaphore(3)
 _data_api_lock = threading.Lock()
-DATA_API_MIN_INTERVAL = 0.1  # 10 req/s max (well under 200/10s limit)
+_data_api_last_call = 0.0
+DATA_API_MIN_INTERVAL = 0.1  # 10 req/s (well under 200/10s limit)
 
-# Phase A timeout: try tx-hash enrichment for this long before falling back
-TX_HASH_ENRICH_TIMEOUT = 10  # seconds
+# How long to wait for enrichment before flushing unenriched
+ENRICH_DELAY = 5  # seconds — give Data API time to have the trade
+
+# Cache: tx_hash → list of decoded OrderFilled fills
+_tx_receipt_cache: dict[str, list[dict]] = {}
+_tx_receipt_cache_lock = threading.Lock()
+_TX_CACHE_MAX = 5000
 
 
 def _rpc_call(method: str, params: list, timeout: int = 15) -> dict | None:
@@ -876,14 +888,11 @@ def _validate_address(addr: str) -> str:
     addr = addr.strip().lower()
     if not addr.startswith("0x"):
         addr = "0x" + addr
-    # Must be 42 chars: 0x + 40 hex digits
     if len(addr) != 42:
-        log.warning(f"[enrich] Malformed address (len={len(addr)}): {addr[:20]}...")
         return ""
     try:
         int(addr[2:], 16)
     except ValueError:
-        log.warning(f"[enrich] Non-hex address: {addr[:20]}...")
         return ""
     return addr
 
@@ -899,7 +908,7 @@ def _decode_order_filled(log_entry: dict) -> dict | None:
     """
     topics = log_entry.get("topics", [])
     data = log_entry.get("data", "0x")
-    if len(topics) < 4 or len(data) < 322:  # 0x + 5*64
+    if len(topics) < 4 or len(data) < 322:
         return None
 
     maker = _validate_address("0x" + topics[2][26:])
@@ -913,59 +922,44 @@ def _decode_order_filled(log_entry: dict) -> dict | None:
     maker_amount = int(d[128:192], 16)
     taker_amount = int(d[192:256], 16)
 
-    # Determine which side is the conditional token and which is USDC (asset_id=0)
     if maker_asset_id != 0 and taker_asset_id == 0:
-        # Maker sells tokens, taker pays USDC
         token_id = str(maker_asset_id)
         token_amount = maker_amount / 1e6
         usdc_amount = taker_amount / 1e6
     elif taker_asset_id != 0 and maker_asset_id == 0:
-        # Taker sells tokens, maker pays USDC
         token_id = str(taker_asset_id)
         token_amount = taker_amount / 1e6
         usdc_amount = maker_amount / 1e6
     else:
-        return None  # Token-to-token swap or both zero — skip
+        return None
 
     if token_amount <= 0:
         return None
-
-    price = usdc_amount / token_amount
 
     return {
         "token_id": token_id,
         "maker": maker,
         "taker": taker,
-        "price": round(price, 6),
+        "price": round(usdc_amount / token_amount, 6),
         "size": round(token_amount, 6),
     }
 
 
-def _enrich_by_tx_hash(tx_hash: str, trades_for_tx: list[dict]) -> int:
-    """Fetch transaction receipt and match OrderFilled events to pending trades.
-
-    Groups trades by tx_hash so ONE RPC call enriches ALL trades from that tx.
-    Within a single tx there are typically 1-3 fills, so matching is near-exact.
-
-    Returns number of trades enriched.
-    """
-    if not tx_hash or not tx_hash.startswith("0x"):
-        return 0
+def _get_fills_for_tx(tx_hash: str) -> list[dict]:
+    """Fetch and cache OrderFilled events from a transaction receipt."""
+    with _tx_receipt_cache_lock:
+        if tx_hash in _tx_receipt_cache:
+            return _tx_receipt_cache[tx_hash]
 
     resp = _rpc_call("eth_getTransactionReceipt", [tx_hash])
     if not resp or not resp.get("result"):
-        return 0
+        return []
 
-    receipt = resp["result"]
-    logs = receipt.get("logs", [])
-
-    # Parse all OrderFilled events from this specific transaction
     fills = []
-    for log_entry in logs:
+    for log_entry in resp["result"].get("logs", []):
         topics = log_entry.get("topics", [])
         if not topics or topics[0] != ORDER_FILLED_TOPIC:
             continue
-        # Only from known exchange contracts
         log_addr = log_entry.get("address", "").lower()
         if not any(log_addr == c.lower() for c in EXCHANGE_CONTRACTS):
             continue
@@ -973,69 +967,76 @@ def _enrich_by_tx_hash(tx_hash: str, trades_for_tx: list[dict]) -> int:
         if fill:
             fills.append(fill)
 
+    with _tx_receipt_cache_lock:
+        # Evict oldest if cache is full
+        if len(_tx_receipt_cache) >= _TX_CACHE_MAX:
+            oldest = next(iter(_tx_receipt_cache))
+            del _tx_receipt_cache[oldest]
+        _tx_receipt_cache[tx_hash] = fills
+
+    return fills
+
+
+def _match_maker_from_receipt(tx_hash: str, token_id: str, price: float,
+                               size: float) -> str:
+    """Get the maker address for a specific fill within a transaction.
+
+    The Data API gives us the taker (proxyWallet) and tx hash.
+    The on-chain receipt gives us maker+taker for each fill in the tx.
+    Match by token_id + price + size within the tx to find the right maker.
+    """
+    fills = _get_fills_for_tx(tx_hash)
     if not fills:
-        return 0
+        return ""
 
-    # Match each pending trade to a fill within this tx
-    # Within one tx, match by exact token_id + tight price/size (0.1%/1%)
-    enriched = 0
-    used_fills = set()
+    best_maker = ""
+    best_score = float("inf")
 
-    for trade in trades_for_tx:
-        if trade["maker"]:  # already enriched
+    for fill in fills:
+        if fill["token_id"] != token_id:
             continue
+        price_diff = abs(fill["price"] - price) / max(price, 0.001)
+        size_diff = abs(fill["size"] - size) / max(size, 0.001)
+        # Within a single tx, matching is very reliable (few fills per tx)
+        if price_diff < 0.01 and size_diff < 0.05:
+            score = price_diff + size_diff
+            if score < best_score:
+                best_score = score
+                best_maker = fill["maker"]
 
-        best_idx = -1
-        best_score = float("inf")
-
-        for i, fill in enumerate(fills):
-            if i in used_fills:
-                continue
-            if fill["token_id"] != trade["token_id"]:
-                continue
-
-            price_diff = abs(fill["price"] - trade["price"]) / max(trade["price"], 0.001)
-            size_diff = abs(fill["size"] - trade["size"]) / max(trade["size"], 0.001)
-
-            # Tight matching within a single tx — typically 1-3 fills
-            if price_diff < 0.001 and size_diff < 0.01:
-                score = price_diff + size_diff
-                if score < best_score:
-                    best_score = score
-                    best_idx = i
-
-        if best_idx >= 0:
-            fill = fills[best_idx]
-            used_fills.add(best_idx)
-            trade["maker"] = fill["maker"]
-            trade["taker"] = fill["taker"]
-            enriched += 1
-
-    return enriched
+    return best_maker
 
 
-def _enrich_by_data_api(trades: list[dict]) -> int:
-    """Fallback: fetch recent trades from Polymarket Data API with maker/taker.
+def _enrich_via_data_api(trades: list[dict]) -> int:
+    """PRIMARY enrichment: fetch trades from Data API, get taker + tx hash,
+    then use tx receipt for maker.
 
-    Only called for trades that tx-hash enrichment missed.
-    Rate limited to 10 req/s.
+    Data API response per trade:
+      - proxyWallet: taker address
+      - transactionHash: on-chain tx hash
+      - price, size, timestamp, asset (token_id)
+
+    Flow: Data API → taker. tx receipt → maker.
     """
     global _data_api_last_call
 
     if not trades:
         return 0
 
-    # Group by token_id to batch API calls
+    # Group unenriched trades by token_id
     by_token: dict[str, list[dict]] = {}
     for trade in trades:
         if trade["maker"]:
             continue
-        tid = trade["token_id"]
-        by_token.setdefault(tid, []).append(trade)
+        by_token.setdefault(trade["token_id"], []).append(trade)
+
+    if not by_token:
+        return 0
 
     enriched = 0
+
     for token_id, token_trades in by_token.items():
-        # Rate limit
+        # Rate limit Data API
         with _data_api_lock:
             now = time.time()
             wait = DATA_API_MIN_INTERVAL - (now - _data_api_last_call)
@@ -1046,105 +1047,124 @@ def _enrich_by_data_api(trades: list[dict]) -> int:
         try:
             resp = requests.get(
                 f"{DATA_API}/trades",
-                params={"asset_id": token_id, "limit": 100},
+                params={"asset_id": token_id, "limit": 200},
                 timeout=10,
             )
+            if resp.status_code == 429:
+                log.warning("[enrich] Data API rate limited, backing off")
+                time.sleep(5)
+                continue
             if resp.status_code != 200:
                 continue
             api_trades = resp.json()
             if not isinstance(api_trades, list):
                 continue
         except Exception as e:
-            log.warning(f"[enrich] Data API error for {token_id[:20]}: {e}")
+            log.warning(f"[enrich] Data API error: {e}")
             continue
 
-        # Match API trades to pending trades by exact price + size + timestamp proximity
+        # Build lookup from API trades: index by (price_rounded, size_rounded)
+        # for fast matching
+        used_api = set()
+
         for trade in token_trades:
             if trade["maker"]:
                 continue
 
-            for api_t in api_trades:
+            for i, api_t in enumerate(api_trades):
+                if i in used_api:
+                    continue
                 try:
                     api_price = float(api_t.get("price", 0))
                     api_size = float(api_t.get("size", 0))
-                    api_ts = int(api_t.get("timestamp", 0))
+                    # Data API timestamp is in SECONDS, our ts_ms is milliseconds
+                    api_ts_ms = int(api_t.get("timestamp", 0)) * 1000
+                    api_asset = api_t.get("asset", "")
                 except (ValueError, TypeError):
                     continue
 
-                # Exact price + size match, timestamp within 2 seconds
-                if (abs(api_price - trade["price"]) < 0.0001
-                        and abs(api_size - trade["size"]) < 0.01
-                        and abs(api_ts - trade["ts_ms"]) < 2000):
-                    maker = _validate_address(api_t.get("maker_address", ""))
-                    taker = _validate_address(api_t.get("taker_address", ""))
-                    if maker and taker:
+                # Must be same token
+                if api_asset != token_id:
+                    continue
+
+                # Match by price (exact to 4 decimals) + size (within 0.5%) + time (5s)
+                price_ok = abs(api_price - trade["price"]) < 0.001
+                size_ok = abs(api_size - trade["size"]) / max(trade["size"], 0.001) < 0.005
+                time_ok = abs(api_ts_ms - trade["ts_ms"]) < 5000
+
+                if price_ok and size_ok and time_ok:
+                    used_api.add(i)
+
+                    # Taker from Data API
+                    taker = _validate_address(api_t.get("proxyWallet", ""))
+
+                    # Maker from on-chain tx receipt
+                    tx_hash = api_t.get("transactionHash", "")
+                    maker = ""
+                    if tx_hash:
+                        maker = _match_maker_from_receipt(
+                            tx_hash, token_id, api_price, api_size
+                        )
+
+                    if taker and maker:
                         trade["maker"] = maker
                         trade["taker"] = taker
                         enriched += 1
-                        break
+                    elif taker:
+                        # Got taker but no maker (tx receipt failed)
+                        # Still write taker, better than nothing
+                        trade["taker"] = taker
+                        trade["maker"] = ""  # will flush unenriched at timeout
+                    break
 
     return enriched
 
 
 def _flush_pending_trades():
-    """Two-phase enrichment, then flush to CSV.
+    """Enrich pending trades via Data API + on-chain, then flush to CSV.
 
-    Phase A (0-10s):  Group by tx_hash, fetch receipts, match exactly within tx.
-    Phase B (10-30s): Data API fallback for remaining unenriched trades.
-    Phase C (30s):    Flush with empty maker/taker (timeout).
+    Phase A (0-5s):   Buffer — wait for Data API to index the trade.
+    Phase B (5-30s):  Data API enrichment (taker + tx hash → maker).
+    Phase C (30s):    Timeout — flush with whatever we have.
     """
     now = time.time()
     to_write = []
+    to_enrich = []
 
     with _pending_trades_lock:
         still_pending = []
-        phase_a_trades: dict[str, list[dict]] = {}  # tx_hash → trades
-        phase_b_trades: list[dict] = []
 
         for trade in _pending_trades:
             age = now - trade["buffered_at"]
 
-            if trade["maker"]:
-                # Already enriched — ready to write
+            if trade["maker"] and trade["taker"]:
+                # Fully enriched — write
                 row = trade["row"]
                 row[8] = trade["maker"]
                 row[9] = trade["taker"]
                 to_write.append(row)
             elif age >= TRADE_BUFFER_TTL:
-                # Phase C: timeout — write unenriched
+                # Timeout — write with whatever we have
                 row = trade["row"]
-                row[8] = ""
-                row[9] = ""
+                row[8] = trade.get("maker", "")
+                row[9] = trade.get("taker", "")
                 to_write.append(row)
-            elif age < TX_HASH_ENRICH_TIMEOUT:
-                # Phase A: try tx-hash enrichment
-                tx_hash = trade.get("tx_hash", "")
-                if tx_hash:
-                    phase_a_trades.setdefault(tx_hash, []).append(trade)
-                else:
-                    still_pending.append(trade)
+            elif age >= ENRICH_DELAY:
+                # Ready for enrichment attempt
+                to_enrich.append(trade)
             else:
-                # Phase B: tx-hash failed, try Data API
-                phase_b_trades.append(trade)
+                # Too young — keep buffering
+                still_pending.append(trade)
 
         _pending_trades[:] = still_pending
 
-    # Phase A: tx-hash enrichment (outside lock to avoid blocking WS)
-    phase_a_enriched = 0
-    all_phase_a = []
-    for tx_hash, trades in phase_a_trades.items():
-        enriched = _enrich_by_tx_hash(tx_hash, trades)
-        phase_a_enriched += enriched
-        all_phase_a.extend(trades)
+    # Enrich via Data API + on-chain (outside lock)
+    n_enriched = _enrich_via_data_api(to_enrich)
 
-    # Phase B: Data API fallback
-    phase_b_enriched = _enrich_by_data_api(phase_b_trades)
-    all_phase_b = phase_b_trades
-
-    # Write enriched trades, re-queue unenriched
+    # Write enriched, re-queue unenriched
     with _pending_trades_lock:
-        for trade in all_phase_a + all_phase_b:
-            if trade["maker"]:
+        for trade in to_enrich:
+            if trade["maker"] and trade["taker"]:
                 row = trade["row"]
                 row[8] = trade["maker"]
                 row[9] = trade["taker"]
@@ -1156,21 +1176,18 @@ def _flush_pending_trades():
         trades_csv.write_rows(to_write)
         trades_csv.flush()
 
-    total_enriched = phase_a_enriched + phase_b_enriched
-    if total_enriched:
+    if n_enriched:
         with _stats_lock:
-            _stats["enriched_trades"] = _stats.get("enriched_trades", 0) + total_enriched
+            _stats["enriched_trades"] = _stats.get("enriched_trades", 0) + n_enriched
 
 
 def enrichment_loop():
     """Background thread: enrich pending trades with maker/taker addresses.
 
-    Uses two-phase approach:
-    1. Fetch tx receipts by hash (exact matching within single transaction)
-    2. Fall back to Polymarket Data API for misses
+    Primary: Data API (proxyWallet=taker, transactionHash) + on-chain receipt (maker).
     """
-    time.sleep(15)  # Wait for initial market discovery
-    log.info("[enrich] Starting two-phase enrichment (tx-hash + Data API fallback)")
+    time.sleep(10)  # Wait for initial market discovery + first trades
+    log.info("[enrich] Starting enrichment (Data API + on-chain receipts)")
 
     while True:
         try:

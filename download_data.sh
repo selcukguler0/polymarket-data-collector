@@ -7,7 +7,7 @@ set -e
 # ── Remote server config ──
 SERVER="69.62.119.76"
 USER="root"
-CONTAINER="06da8c6ca46b"
+CONTAINER="0d3a35f8143f"
 
 # ── Paths ──
 LOCAL_DIR="${1:-./downloaded_data}"
