@@ -978,12 +978,16 @@ def _get_fills_for_tx(tx_hash: str) -> list[dict]:
 
 
 def _match_maker_from_receipt(tx_hash: str, token_id: str, price: float,
-                               size: float) -> str:
+                               size: float, known_taker: str = "") -> str:
     """Get the maker address for a specific fill within a transaction.
 
     The Data API gives us the taker (proxyWallet) and tx hash.
-    The on-chain receipt gives us maker+taker for each fill in the tx.
-    Match by token_id + price + size within the tx to find the right maker.
+    The on-chain receipt gives us maker+taker for each OrderFilled event.
+    Match by token_id + price + size within the tx to find the maker.
+
+    known_taker is used to:
+    1. Confirm we matched the right fill (on-chain taker should match Data API taker)
+    2. Ensure we return the MAKER, not the taker
     """
     fills = _get_fills_for_tx(tx_hash)
     if not fills:
@@ -995,47 +999,72 @@ def _match_maker_from_receipt(tx_hash: str, token_id: str, price: float,
     for fill in fills:
         if fill["token_id"] != token_id:
             continue
+
         price_diff = abs(fill["price"] - price) / max(price, 0.001)
         size_diff = abs(fill["size"] - size) / max(size, 0.001)
-        # Within a single tx, matching is very reliable (few fills per tx)
-        if price_diff < 0.01 and size_diff < 0.05:
+
+        if price_diff < 0.02 and size_diff < 0.05:
             score = price_diff + size_diff
+
+            # Prefer fills where on-chain taker matches Data API taker
+            if known_taker and fill["taker"] == known_taker:
+                score -= 1.0  # strong preference
+
             if score < best_score:
                 best_score = score
                 best_maker = fill["maker"]
+
+    # Safety: maker must differ from known taker
+    if best_maker and known_taker and best_maker == known_taker:
+        # On-chain maker/taker might be swapped depending on order direction.
+        # In OrderFilled: maker = order placer, taker = order filler.
+        # If proxyWallet is the maker (order placer), the other side is the taker.
+        # Try returning the on-chain taker instead.
+        for fill in fills:
+            if fill["token_id"] != token_id:
+                continue
+            price_diff = abs(fill["price"] - price) / max(price, 0.001)
+            size_diff = abs(fill["size"] - size) / max(size, 0.001)
+            if price_diff < 0.02 and size_diff < 0.05:
+                if fill["maker"] == known_taker and fill["taker"] != known_taker:
+                    return fill["taker"]
+                if fill["taker"] == known_taker and fill["maker"] != known_taker:
+                    return fill["maker"]
+        return ""  # couldn't resolve — don't write wrong data
 
     return best_maker
 
 
 def _enrich_via_data_api(trades: list[dict]) -> int:
-    """PRIMARY enrichment: fetch trades from Data API, get taker + tx hash,
-    then use tx receipt for maker.
+    """PRIMARY enrichment: fetch trades from Data API by condition_id,
+    get taker (proxyWallet) + tx hash, then use tx receipt for maker.
 
     Data API response per trade:
-      - proxyWallet: taker address
-      - transactionHash: on-chain tx hash
-      - price, size, timestamp, asset (token_id)
+      - proxyWallet: taker address (the order initiator)
+      - transactionHash: on-chain tx hash (for maker lookup)
+      - asset: token_id, price, size, timestamp, side
 
-    Flow: Data API → taker. tx receipt → maker.
+    Flow: Data API → taker. transactionHash → on-chain receipt → maker.
     """
     global _data_api_last_call
 
     if not trades:
         return 0
 
-    # Group unenriched trades by token_id
-    by_token: dict[str, list[dict]] = {}
+    # Group unenriched trades by condition_id (Data API filters by market, not token)
+    by_market: dict[str, list[dict]] = {}
     for trade in trades:
-        if trade["maker"]:
+        if trade["maker"] and trade["taker"]:
             continue
-        by_token.setdefault(trade["token_id"], []).append(trade)
+        cid = trade["row"][1]  # condition_id is column index 1
+        by_market.setdefault(cid, []).append(trade)
 
-    if not by_token:
+    if not by_market:
         return 0
 
     enriched = 0
 
-    for token_id, token_trades in by_token.items():
+    for condition_id, market_trades in by_market.items():
         # Rate limit Data API
         with _data_api_lock:
             now = time.time()
@@ -1045,9 +1074,10 @@ def _enrich_via_data_api(trades: list[dict]) -> int:
             _data_api_last_call = time.time()
 
         try:
+            # Use market= param which properly filters by condition_id
             resp = requests.get(
                 f"{DATA_API}/trades",
-                params={"asset_id": token_id, "limit": 200},
+                params={"market": condition_id, "limit": 500},
                 timeout=10,
             )
             if resp.status_code == 429:
@@ -1055,6 +1085,7 @@ def _enrich_via_data_api(trades: list[dict]) -> int:
                 time.sleep(5)
                 continue
             if resp.status_code != 200:
+                log.debug(f"[enrich] Data API {resp.status_code} for {condition_id[:16]}")
                 continue
             api_trades = resp.json()
             if not isinstance(api_trades, list):
@@ -1063,12 +1094,13 @@ def _enrich_via_data_api(trades: list[dict]) -> int:
             log.warning(f"[enrich] Data API error: {e}")
             continue
 
-        # Build lookup from API trades: index by (price_rounded, size_rounded)
-        # for fast matching
+        if not api_trades:
+            continue
+
         used_api = set()
 
-        for trade in token_trades:
-            if trade["maker"]:
+        for trade in market_trades:
+            if trade["maker"] and trade["taker"]:
                 continue
 
             for i, api_t in enumerate(api_trades):
@@ -1077,33 +1109,37 @@ def _enrich_via_data_api(trades: list[dict]) -> int:
                 try:
                     api_price = float(api_t.get("price", 0))
                     api_size = float(api_t.get("size", 0))
-                    # Data API timestamp is in SECONDS, our ts_ms is milliseconds
+                    # Data API timestamp is in SECONDS, WS ts_ms is milliseconds
                     api_ts_ms = int(api_t.get("timestamp", 0)) * 1000
-                    api_asset = api_t.get("asset", "")
+                    api_asset = str(api_t.get("asset", ""))
+                    api_side = api_t.get("side", "").upper()
                 except (ValueError, TypeError):
                     continue
 
-                # Must be same token
-                if api_asset != token_id:
+                # Must match: same token + same side + close price + close size + close time
+                if api_asset != trade["token_id"]:
+                    continue
+                if api_side != trade["row"][4]:  # side is column 4
                     continue
 
-                # Match by price (exact to 4 decimals) + size (within 0.5%) + time (5s)
-                price_ok = abs(api_price - trade["price"]) < 0.001
-                size_ok = abs(api_size - trade["size"]) / max(trade["size"], 0.001) < 0.005
+                price_ok = abs(api_price - trade["price"]) < 0.005
+                size_ok = (abs(api_size - trade["size"]) /
+                           max(trade["size"], 0.001) < 0.02)
                 time_ok = abs(api_ts_ms - trade["ts_ms"]) < 5000
 
                 if price_ok and size_ok and time_ok:
                     used_api.add(i)
 
-                    # Taker from Data API
+                    # Taker from Data API (proxyWallet = order initiator = taker)
                     taker = _validate_address(api_t.get("proxyWallet", ""))
 
                     # Maker from on-chain tx receipt
                     tx_hash = api_t.get("transactionHash", "")
                     maker = ""
-                    if tx_hash:
+                    if tx_hash and taker:
                         maker = _match_maker_from_receipt(
-                            tx_hash, token_id, api_price, api_size
+                            tx_hash, trade["token_id"],
+                            api_price, api_size, taker
                         )
 
                     if taker and maker:
@@ -1111,10 +1147,8 @@ def _enrich_via_data_api(trades: list[dict]) -> int:
                         trade["taker"] = taker
                         enriched += 1
                     elif taker:
-                        # Got taker but no maker (tx receipt failed)
-                        # Still write taker, better than nothing
+                        # Got taker but no maker — still useful, write taker
                         trade["taker"] = taker
-                        trade["maker"] = ""  # will flush unenriched at timeout
                     break
 
     return enriched
