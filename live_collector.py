@@ -123,11 +123,8 @@ _token_index_lock = threading.Lock()
 _pending_trades: list[dict] = []
 _pending_trades_lock = threading.Lock()
 
-# On-chain fills cache: {token_id_str: deque([(block_ts_ms, maker, taker, price, size), ...])}
-_chain_fills: dict[str, collections.deque] = {}
-_chain_fills_lock = threading.Lock()
-_chain_last_block: int = 0  # last polled block number
-_chain_rpc_idx: int = 0     # round-robin RPC index
+# RPC round-robin index for on-chain enrichment
+_chain_rpc_idx: int = 0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -805,7 +802,7 @@ def ws_trade_listener():
                     row = [
                         ts, mkt["condition_id"], token_id, outcome,
                         side, price, size, trade_id,
-                        "", "",  # maker/taker — enriched from chain
+                        "", "",  # maker/taker — enriched via tx-hash or Data API
                         bb, ba, bm,
                         mkt["coin"], mkt["timeframe"], mkt["slug"],
                     ]
@@ -816,6 +813,7 @@ def ws_trade_listener():
                             "price": price,
                             "size": size,
                             "ts_ms": ts,
+                            "tx_hash": trade_id,  # WS trade_id is the on-chain tx hash
                             "buffered_at": time.time(),
                             "maker": "",
                             "taker": "",
@@ -833,28 +831,61 @@ def ws_trade_listener():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  On-chain enrichment (maker/taker addresses from Polygon OrderFilled events)
+#  On-chain enrichment (maker/taker via tx-hash receipt + Data API fallback)
 # ═════════════════════════════════════════════════════════════════════════════
+
+# Data API for fallback enrichment
+DATA_API = "https://data-api.polymarket.com"
+
+# Rate limiting for RPC and Data API
+_rpc_semaphore = threading.Semaphore(3)  # max 3 concurrent RPC calls
+_data_api_last_call = 0.0
+_data_api_lock = threading.Lock()
+DATA_API_MIN_INTERVAL = 0.1  # 10 req/s max (well under 200/10s limit)
+
+# Phase A timeout: try tx-hash enrichment for this long before falling back
+TX_HASH_ENRICH_TIMEOUT = 10  # seconds
+
 
 def _rpc_call(method: str, params: list, timeout: int = 15) -> dict | None:
     """Make a JSON-RPC call with round-robin RPC failover and rate limiting."""
     global _chain_rpc_idx
-    time.sleep(CHAIN_RPC_RATE)
-    for attempt in range(len(POLYGON_RPCS)):
-        rpc_url = POLYGON_RPCS[_chain_rpc_idx % len(POLYGON_RPCS)]
-        try:
-            resp = requests.post(rpc_url, json={
-                "jsonrpc": "2.0", "method": method, "params": params, "id": 1,
-            }, timeout=timeout)
-            data = resp.json()
-            if "result" in data:
-                return data
-            err = data.get("error", {})
-            log.warning(f"[chain] RPC error from {rpc_url}: {err.get('message', err)}")
-        except Exception as e:
-            log.warning(f"[chain] RPC {rpc_url} failed: {e}")
-        _chain_rpc_idx += 1
+    with _rpc_semaphore:
+        time.sleep(CHAIN_RPC_RATE)
+        for attempt in range(len(POLYGON_RPCS)):
+            rpc_url = POLYGON_RPCS[_chain_rpc_idx % len(POLYGON_RPCS)]
+            try:
+                resp = requests.post(rpc_url, json={
+                    "jsonrpc": "2.0", "method": method, "params": params, "id": 1,
+                }, timeout=timeout)
+                data = resp.json()
+                if "result" in data:
+                    return data
+                err = data.get("error", {})
+                log.warning(f"[enrich] RPC error from {rpc_url}: {err.get('message', err)}")
+            except Exception as e:
+                log.warning(f"[enrich] RPC {rpc_url} failed: {e}")
+            _chain_rpc_idx += 1
     return None
+
+
+def _validate_address(addr: str) -> str:
+    """Normalize and validate an Ethereum address."""
+    if not addr:
+        return ""
+    addr = addr.strip().lower()
+    if not addr.startswith("0x"):
+        addr = "0x" + addr
+    # Must be 42 chars: 0x + 40 hex digits
+    if len(addr) != 42:
+        log.warning(f"[enrich] Malformed address (len={len(addr)}): {addr[:20]}...")
+        return ""
+    try:
+        int(addr[2:], 16)
+    except ValueError:
+        log.warning(f"[enrich] Non-hex address: {addr[:20]}...")
+        return ""
+    return addr
 
 
 def _decode_order_filled(log_entry: dict) -> dict | None:
@@ -871,8 +902,10 @@ def _decode_order_filled(log_entry: dict) -> dict | None:
     if len(topics) < 4 or len(data) < 322:  # 0x + 5*64
         return None
 
-    maker = "0x" + topics[2][26:]
-    taker = "0x" + topics[3][26:]
+    maker = _validate_address("0x" + topics[2][26:])
+    taker = _validate_address("0x" + topics[3][26:])
+    if not maker or not taker:
+        return None
 
     d = data[2:]
     maker_asset_id = int(d[0:64], 16)
@@ -905,84 +938,67 @@ def _decode_order_filled(log_entry: dict) -> dict | None:
         "taker": taker,
         "price": round(price, 6),
         "size": round(token_amount, 6),
-        "block_number": int(log_entry.get("blockNumber", "0x0"), 16),
     }
 
 
-def _poll_chain_fills():
-    """Poll OrderFilled events from both exchange contracts for the latest block range."""
-    global _chain_last_block
+def _enrich_by_tx_hash(tx_hash: str, trades_for_tx: list[dict]) -> int:
+    """Fetch transaction receipt and match OrderFilled events to pending trades.
 
-    # Get latest block
-    resp = _rpc_call("eth_blockNumber", [])
-    if not resp:
-        return
-    latest = int(resp["result"], 16)
+    Groups trades by tx_hash so ONE RPC call enriches ALL trades from that tx.
+    Within a single tx there are typically 1-3 fills, so matching is near-exact.
 
-    if _chain_last_block == 0:
-        # First poll: start from 5 blocks back (~10s on Polygon)
-        _chain_last_block = latest - 5
-
-    if latest <= _chain_last_block:
-        return
-
-    from_block = hex(_chain_last_block + 1)
-    to_block = hex(latest)
-
-    # Get known token IDs for filtering
-    with _token_index_lock:
-        known_tokens = set(_token_index.keys())
-
-    new_fills = 0
-    for contract_addr in EXCHANGE_CONTRACTS:
-        resp = _rpc_call("eth_getLogs", [{
-            "fromBlock": from_block,
-            "toBlock": to_block,
-            "address": contract_addr,
-            "topics": [ORDER_FILLED_TOPIC],
-        }], timeout=30)
-        if not resp:
-            continue
-
-        for log_entry in resp.get("result", []):
-            fill = _decode_order_filled(log_entry)
-            if not fill:
-                continue
-            # Only keep fills for tokens we're tracking
-            if fill["token_id"] not in known_tokens:
-                continue
-
-            with _chain_fills_lock:
-                if fill["token_id"] not in _chain_fills:
-                    _chain_fills[fill["token_id"]] = collections.deque(maxlen=200)
-                _chain_fills[fill["token_id"]].append(fill)
-                new_fills += 1
-
-    _chain_last_block = latest
-
-    if new_fills:
-        with _stats_lock:
-            _stats["chain_fills"] = _stats.get("chain_fills", 0) + new_fills
-
-
-def _match_fill(token_id: str, price: float, size: float) -> tuple[str, str]:
-    """Find the best matching on-chain fill for a WS trade.
-
-    Match by token_id (exact) + price proximity (<1%) + size proximity (<10%).
-    Returns (maker, taker) or ("", "").
+    Returns number of trades enriched.
     """
-    with _chain_fills_lock:
-        fills = _chain_fills.get(token_id)
-        if not fills:
-            return "", ""
+    if not tx_hash or not tx_hash.startswith("0x"):
+        return 0
+
+    resp = _rpc_call("eth_getTransactionReceipt", [tx_hash])
+    if not resp or not resp.get("result"):
+        return 0
+
+    receipt = resp["result"]
+    logs = receipt.get("logs", [])
+
+    # Parse all OrderFilled events from this specific transaction
+    fills = []
+    for log_entry in logs:
+        topics = log_entry.get("topics", [])
+        if not topics or topics[0] != ORDER_FILLED_TOPIC:
+            continue
+        # Only from known exchange contracts
+        log_addr = log_entry.get("address", "").lower()
+        if not any(log_addr == c.lower() for c in EXCHANGE_CONTRACTS):
+            continue
+        fill = _decode_order_filled(log_entry)
+        if fill:
+            fills.append(fill)
+
+    if not fills:
+        return 0
+
+    # Match each pending trade to a fill within this tx
+    # Within one tx, match by exact token_id + tight price/size (0.1%/1%)
+    enriched = 0
+    used_fills = set()
+
+    for trade in trades_for_tx:
+        if trade["maker"]:  # already enriched
+            continue
 
         best_idx = -1
         best_score = float("inf")
 
         for i, fill in enumerate(fills):
-            price_diff = abs(fill["price"] - price) / max(price, 0.001)
-            size_diff = abs(fill["size"] - size) / max(size, 0.001)
-            if price_diff < 0.01 and size_diff < 0.10:
+            if i in used_fills:
+                continue
+            if fill["token_id"] != trade["token_id"]:
+                continue
+
+            price_diff = abs(fill["price"] - trade["price"]) / max(trade["price"], 0.001)
+            size_diff = abs(fill["size"] - trade["size"]) / max(trade["size"], 0.001)
+
+            # Tight matching within a single tx — typically 1-3 fills
+            if price_diff < 0.001 and size_diff < 0.01:
                 score = price_diff + size_diff
                 if score < best_score:
                     best_score = score
@@ -990,66 +1006,180 @@ def _match_fill(token_id: str, price: float, size: float) -> tuple[str, str]:
 
         if best_idx >= 0:
             fill = fills[best_idx]
-            # Remove the matched fill to prevent double-matching
-            del fills[best_idx]
-            return fill["maker"], fill["taker"]
+            used_fills.add(best_idx)
+            trade["maker"] = fill["maker"]
+            trade["taker"] = fill["taker"]
+            enriched += 1
 
-    return "", ""
+    return enriched
+
+
+def _enrich_by_data_api(trades: list[dict]) -> int:
+    """Fallback: fetch recent trades from Polymarket Data API with maker/taker.
+
+    Only called for trades that tx-hash enrichment missed.
+    Rate limited to 10 req/s.
+    """
+    global _data_api_last_call
+
+    if not trades:
+        return 0
+
+    # Group by token_id to batch API calls
+    by_token: dict[str, list[dict]] = {}
+    for trade in trades:
+        if trade["maker"]:
+            continue
+        tid = trade["token_id"]
+        by_token.setdefault(tid, []).append(trade)
+
+    enriched = 0
+    for token_id, token_trades in by_token.items():
+        # Rate limit
+        with _data_api_lock:
+            now = time.time()
+            wait = DATA_API_MIN_INTERVAL - (now - _data_api_last_call)
+            if wait > 0:
+                time.sleep(wait)
+            _data_api_last_call = time.time()
+
+        try:
+            resp = requests.get(
+                f"{DATA_API}/trades",
+                params={"asset_id": token_id, "limit": 100},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            api_trades = resp.json()
+            if not isinstance(api_trades, list):
+                continue
+        except Exception as e:
+            log.warning(f"[enrich] Data API error for {token_id[:20]}: {e}")
+            continue
+
+        # Match API trades to pending trades by exact price + size + timestamp proximity
+        for trade in token_trades:
+            if trade["maker"]:
+                continue
+
+            for api_t in api_trades:
+                try:
+                    api_price = float(api_t.get("price", 0))
+                    api_size = float(api_t.get("size", 0))
+                    api_ts = int(api_t.get("timestamp", 0))
+                except (ValueError, TypeError):
+                    continue
+
+                # Exact price + size match, timestamp within 2 seconds
+                if (abs(api_price - trade["price"]) < 0.0001
+                        and abs(api_size - trade["size"]) < 0.01
+                        and abs(api_ts - trade["ts_ms"]) < 2000):
+                    maker = _validate_address(api_t.get("maker_address", ""))
+                    taker = _validate_address(api_t.get("taker_address", ""))
+                    if maker and taker:
+                        trade["maker"] = maker
+                        trade["taker"] = taker
+                        enriched += 1
+                        break
+
+    return enriched
 
 
 def _flush_pending_trades():
-    """Attempt to enrich pending trades with on-chain data, then flush to CSV."""
+    """Two-phase enrichment, then flush to CSV.
+
+    Phase A (0-10s):  Group by tx_hash, fetch receipts, match exactly within tx.
+    Phase B (10-30s): Data API fallback for remaining unenriched trades.
+    Phase C (30s):    Flush with empty maker/taker (timeout).
+    """
     now = time.time()
     to_write = []
 
     with _pending_trades_lock:
         still_pending = []
+        phase_a_trades: dict[str, list[dict]] = {}  # tx_hash → trades
+        phase_b_trades: list[dict] = []
+
         for trade in _pending_trades:
             age = now - trade["buffered_at"]
-            if not trade["maker"]:
-                maker, taker = _match_fill(trade["token_id"], trade["price"], trade["size"])
-                if maker:
-                    trade["maker"] = maker
-                    trade["taker"] = taker
-                    with _stats_lock:
-                        _stats["enriched_trades"] = _stats.get("enriched_trades", 0) + 1
 
-            if trade["maker"] or age >= TRADE_BUFFER_TTL:
-                # Ready to write (enriched or timed out)
+            if trade["maker"]:
+                # Already enriched — ready to write
                 row = trade["row"]
-                row[8] = trade["maker"]   # maker_address column
-                row[9] = trade["taker"]   # taker_address column
+                row[8] = trade["maker"]
+                row[9] = trade["taker"]
+                to_write.append(row)
+            elif age >= TRADE_BUFFER_TTL:
+                # Phase C: timeout — write unenriched
+                row = trade["row"]
+                row[8] = ""
+                row[9] = ""
+                to_write.append(row)
+            elif age < TX_HASH_ENRICH_TIMEOUT:
+                # Phase A: try tx-hash enrichment
+                tx_hash = trade.get("tx_hash", "")
+                if tx_hash:
+                    phase_a_trades.setdefault(tx_hash, []).append(trade)
+                else:
+                    still_pending.append(trade)
+            else:
+                # Phase B: tx-hash failed, try Data API
+                phase_b_trades.append(trade)
+
+        _pending_trades[:] = still_pending
+
+    # Phase A: tx-hash enrichment (outside lock to avoid blocking WS)
+    phase_a_enriched = 0
+    all_phase_a = []
+    for tx_hash, trades in phase_a_trades.items():
+        enriched = _enrich_by_tx_hash(tx_hash, trades)
+        phase_a_enriched += enriched
+        all_phase_a.extend(trades)
+
+    # Phase B: Data API fallback
+    phase_b_enriched = _enrich_by_data_api(phase_b_trades)
+    all_phase_b = phase_b_trades
+
+    # Write enriched trades, re-queue unenriched
+    with _pending_trades_lock:
+        for trade in all_phase_a + all_phase_b:
+            if trade["maker"]:
+                row = trade["row"]
+                row[8] = trade["maker"]
+                row[9] = trade["taker"]
                 to_write.append(row)
             else:
-                still_pending.append(trade)
-        _pending_trades[:] = still_pending
+                _pending_trades.append(trade)
 
     if to_write:
         trades_csv.write_rows(to_write)
         trades_csv.flush()
 
+    total_enriched = phase_a_enriched + phase_b_enriched
+    if total_enriched:
+        with _stats_lock:
+            _stats["enriched_trades"] = _stats.get("enriched_trades", 0) + total_enriched
 
-def chain_enrichment_loop():
-    """Background thread: poll on-chain OrderFilled events, match to pending trades."""
-    # Wait for initial market discovery
-    time.sleep(15)
-    log.info("[chain] Starting on-chain enrichment (polling OrderFilled events)")
+
+def enrichment_loop():
+    """Background thread: enrich pending trades with maker/taker addresses.
+
+    Uses two-phase approach:
+    1. Fetch tx receipts by hash (exact matching within single transaction)
+    2. Fall back to Polymarket Data API for misses
+    """
+    time.sleep(15)  # Wait for initial market discovery
+    log.info("[enrich] Starting two-phase enrichment (tx-hash + Data API fallback)")
 
     while True:
         try:
-            _poll_chain_fills()
             _flush_pending_trades()
-            # Prune old fills (older than 2 min)
-            with _chain_fills_lock:
-                for token_id in list(_chain_fills.keys()):
-                    dq = _chain_fills[token_id]
-                    if not dq:
-                        del _chain_fills[token_id]
         except Exception as e:
-            log.error(f"[chain] Error: {e}")
+            log.error(f"[enrich] Error: {e}")
             with _stats_lock:
                 _stats["errors"] += 1
-        time.sleep(CHAIN_POLL_INTERVAL)
+        time.sleep(2)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1132,7 +1262,7 @@ def run_live_collector():
         ("outcomes", outcome_loop),
         ("csv-flusher", flush_loop),
         ("ws-trades", ws_trade_listener),
-        ("chain-enrichment", chain_enrichment_loop),
+        ("enrichment", enrichment_loop),
     ]
 
     for name, target in threads:
@@ -1152,7 +1282,6 @@ def run_live_collector():
                 ws_ok = _stats["ws_connected"]
                 trades = _stats["trades_captured"]
                 errs = _stats["errors"]
-                chain_fills = _stats.get("chain_fills", 0)
                 enriched = _stats.get("enriched_trades", 0)
             with _pending_trades_lock:
                 pending = len(_pending_trades)
@@ -1161,7 +1290,6 @@ def run_live_collector():
                 f"books_this_cycle={books} ({cycle:.1f}s) | "
                 f"ws={ws_ok} | "
                 f"trades={trades} enriched={enriched} pending={pending} | "
-                f"chain_fills={chain_fills} | "
                 f"errors={errs}"
             )
     except KeyboardInterrupt:
